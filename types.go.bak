@@ -1,0 +1,24 @@
+package main
+
+import (
+	"github.com/google/uuid"
+)
+
+type Message struct {
+	ID      string
+	Content string
+	Role    string
+}
+
+func NewMessage(content string, role string) *Message {
+	return &Message{
+		ID:      uuid.New().String(),
+		Content: content,
+		Role:    role,
+	}
+}
+
+type LlmSdk interface {
+	StreamMessage(Message string, handleDelta func(string) error) (Message, error)
+	SimpleMessage(Message string) (Message, error)
+}
