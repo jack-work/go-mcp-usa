@@ -2,21 +2,22 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
+	"strings"
 
+	"go-mcp-usa/jsonrpc"
+	"go-mcp-usa/logging"
 	"go-mcp-usa/mcp"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 )
 
 type DockerServer struct {
@@ -43,21 +44,7 @@ func (server *DockerServer) Setup() error {
 	return err
 }
 
-func processContainerOutput(reader io.Reader, stdoutWriter io.Writer, stderrWriter io.Writer, doneCh chan error) {
-	// Create buffers for stdout and stderr
-	stdoutBuf := &bytes.Buffer{}
-	stderrBuf := &bytes.Buffer{}
-
-	// Use stdcopy to handle the Docker multiplexing
-	fmt.Println("test")
-	// _, err := stdcopy.StdCopy(stdoutWriter, stderrWriter, reader)
-	_, err := stdcopy.StdCopy(stdoutBuf, stderrBuf, reader)
-	fmt.Println("test2")
-	if err != nil {
-		doneCh <- fmt.Errorf("error processing container output: %v", err)
-		return
-	}
-
+func processContainerOutput(reader io.Reader, responseChan chan jsonrpc.Message, doneCh chan error) {
 	// Process stdout for JSON messages
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
@@ -65,30 +52,27 @@ func processContainerOutput(reader io.Reader, stdoutWriter io.Writer, stderrWrit
 		if len(line) == 0 {
 			continue
 		}
+		// Remove any non-printable characters at the beginning
+		var cleanLine string
+		if idx := strings.Index(line, "{"); idx != -1 {
+			cleanLine = line[idx:]
+		} else {
+			cleanLine = line
+		}
 
 		// Try to parse as JSON
-		var jsonData interface{}
-		if err := json.Unmarshal([]byte(line), &jsonData); err != nil {
-			// If not valid JSON, print the raw line
-			fmt.Println(line)
+		var response jsonrpc.Message
+		if err := json.Unmarshal([]byte(cleanLine), &response); err != nil {
+			fmt.Println(err)
+			doneCh <- scanner.Err()
 		} else {
-			// Format the JSON with indentation
-			prettyJSON, err := json.MarshalIndent(jsonData, "", "    ")
-			if err != nil {
-				fmt.Println(line)
-			} else {
-				fmt.Println(string(prettyJSON))
-			}
+			responseChan <- response
 		}
-	}
-
-	// Check if there's any stderr content to print
-	if stderrBuf.Len() > 0 {
-		fmt.Fprintf(os.Stderr, "Container stderr: %s\n", stderrBuf.String())
 	}
 
 	doneCh <- scanner.Err()
 }
+
 func attachToContainer(ctx context.Context, cli *client.Client, id string) error {
 	// Wait for the container to finis
 	// Attach to the container
@@ -105,42 +89,36 @@ func attachToContainer(ctx context.Context, cli *client.Client, id string) error
 
 	// Set up a goroutine to handle container output
 	outputDone := make(chan error)
-	go processContainerOutput(waiter.Reader, os.Stdout, os.Stderr, outputDone)
-	// go func() {
-	// 	// Use StdCopy to demultiplex the output stream
-	// 	_, err := stdcopy.StdCopy(os.Stdout, os.Stderr, waiter.Reader)
-	// 	outputDone <- err
-	// }()
-	// Create initialization message
-	initMessage := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "initialize",
-		"params": map[string]interface{}{
-			"protocolVersion": "0.1.0", // Note: "protocolVersion" not "version"
-			"clientInfo": map[string]interface{}{
-				"name":    "bach",
-				"version": "1.0.0",
+	responseChan := make(chan jsonrpc.Message)
+
+	go processContainerOutput(waiter.Reader, responseChan, outputDone)
+	go jsonrpc.ReceiveMessages(responseChan)
+
+	message := jsonrpc.Message{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "initialize",
+		Params: jsonrpc.InitializeParams{
+			ProtocolVersion: "0.1.0",
+			ClientInfo: jsonrpc.ClientInfo{
+				Name:    "bach",
+				Version: "1.0.0",
 			},
-			"capabilities": map[string]interface{}{
-				"tools":     true,
-				"prompts":   false,
-				"resources": true,
+			Capabilities: jsonrpc.ClientCapabilities{
+				Tools:     true,
+				Prompts:   false,
+				Resources: true,
 			},
 		},
 	}
 
-	// Marshal to JSON and add newline
-	initMessageJSON, err := json.Marshal(initMessage)
-	if err != nil {
-		return fmt.Errorf("failed to marshal initialization message: %v", err)
-	}
-	initMessageJSON = append(initMessageJSON, '\n')
-
-	// Send the message to the container's stdin
-	if _, err := waiter.Conn.Write(initMessageJSON); err != nil {
-		return fmt.Errorf("failed to send initialization message: %v", err)
-	}
+	jsonrpc.SendMessage(message, waiter.Conn)
+	jsonrpc.SendMessage(jsonrpc.Message{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "request",
+		Params:  map[string]string{},
+	}, waiter.Conn)
 
 	// Wait for either the output processing to complete or context cancellation
 	select {
@@ -182,15 +160,6 @@ func getOrCreateContainer(ctx context.Context, cli *client.Client, server Docker
 	return id, err
 }
 
-func printTelemetry[T any](content T) {
-	telem, err := json.MarshalIndent(content, "", "  ")
-	if err != nil {
-		fmt.Printf("Cannot print telemetry: %w", err)
-	} else {
-		fmt.Println(string(telem))
-	}
-}
-
 func getContainerByName(ctx context.Context, cli *client.Client, name string) (*string, bool, error) {
 	return getContainer(ctx, cli, filters.KeyValuePair{
 		Key:   "name",
@@ -212,7 +181,7 @@ func getContainer(ctx context.Context, cli *client.Client, args filters.KeyValue
 		fmt.Println("Multiple containers found:")
 	}
 
-	printTelemetry(containers)
+	logging.PrintTelemetry(containers)
 	container := &containers[0]
 	return &container.ID, container.State == "running", err
 }
@@ -249,7 +218,7 @@ func getContainerFromImage(
 
 	fmt.Printf("📜 Image %s found locally\n", imageName)
 
-	printTelemetry(images)
+	logging.PrintTelemetry(images)
 	if len(images) == 0 {
 		return nil, name, false, fmt.Errorf("No images found with the provided name: %s", imageName)
 	}
