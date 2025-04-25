@@ -1,15 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
-	"strings"
-	"time"
 
 	"go-mcp-usa/jsonrpc"
 	"go-mcp-usa/logging"
@@ -27,54 +23,23 @@ type DockerServer struct {
 	ContainerName *string // if not specified and ImageName is specified, a new container will be created with a default name
 }
 
-func (server *DockerServer) Setup() error {
+func (server *DockerServer) Setup() (*jsonrpc.Client[string], error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return fmt.Errorf("Docker client could not be created: %w", err)
+		return nil, fmt.Errorf("Docker client could not be created: %w", err)
 	}
 	defer cli.Close()
 
 	id, err := getOrCreateContainer(ctx, cli, *server)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	fmt.Println(id)
-	err = attachToContainer(ctx, cli, *id)
-	return err
+	return attachToContainer(ctx, cli, *id)
 }
 
-func processContainerOutput(reader io.Reader, responseChan chan jsonrpc.Message, doneCh chan error) {
-	// Process stdout for JSON messages
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) == 0 {
-			continue
-		}
-		// Remove any non-printable characters at the beginning
-		var cleanLine string
-		if idx := strings.Index(line, "{"); idx != -1 {
-			cleanLine = line[idx:]
-		} else {
-			cleanLine = line
-		}
-
-		// Try to parse as JSON
-		var response jsonrpc.Message
-		if err := json.Unmarshal([]byte(cleanLine), &response); err != nil {
-			fmt.Println(err)
-			doneCh <- scanner.Err()
-		} else {
-			responseChan <- response
-		}
-	}
-
-	doneCh <- scanner.Err()
-}
-
-func attachToContainer(ctx context.Context, cli *client.Client, id string) error {
+func attachToContainer(ctx context.Context, cli *client.Client, id string) (*jsonrpc.Client[string], error) {
 	// Wait for the container to finis
 	// Attach to the container
 	waiter, err := cli.ContainerAttach(ctx, id, container.AttachOptions{
@@ -84,68 +49,29 @@ func attachToContainer(ctx context.Context, cli *client.Client, id string) error
 		Stderr: true,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer waiter.Close()
 
 	// Set up a goroutine to handle container output
 	outputDone := make(chan error)
-	responseChan := make(chan jsonrpc.Message)
 
-	go processContainerOutput(waiter.Reader, responseChan, outputDone)
-	go jsonrpc.ReceiveMessages(responseChan)
-
-	message := jsonrpc.Message{
-		JSONRPC: "2.0",
-		ID:      1,
-		Method:  "initialize",
-		Params: jsonrpc.InitializeParams{
-			ProtocolVersion: "0.1.0",
-			ClientInfo: jsonrpc.ClientInfo{
-				Name:    "bach",
-				Version: "1.0.0",
-			},
-			Capabilities: jsonrpc.ClientCapabilities{
-				Tools:     true,
-				Prompts:   false,
-				Resources: true,
-			},
-		},
-	}
-
-	jsonrpc.SendMessage(message, waiter.Conn)
-	// todo:  implement a call and response pattern here
-	time.Sleep(1 * time.Second)
-	jsonrpc.SendMessage(jsonrpc.Message{
-		JSONRPC: "2.0",
-		ID:      2,
-		Method:  "tools/list",
-	}, waiter.Conn)
-	time.Sleep(1 * time.Second)
-	jsonrpc.SendMessage(jsonrpc.Message{
-		JSONRPC: "2.0",
-		ID:      3,
-		Method:  "tools/call",
-		Params: map[string]any{
-			"name": "brave_web_search",
-			"arguments": map[string]string{
-				"query": "search the internet for beetles",
-				"count": "100",
-			},
-		},
-	}, waiter.Conn)
-
-	// Wait for either the output processing to complete or context cancellation
-	select {
-	case err := <-outputDone:
-		if err != nil {
-			return fmt.Errorf("error processing container output: %v", err)
+	telemChan := make(chan jsonrpc.Message[string, any])
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case result := <-telemChan:
+				logging.PrintTelemetry(result)
+			}
 		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	}()
 
-	return nil
+	list := map[string]chan jsonrpc.Message[string, any]{
+		"*": telemChan,
+	}
+	return jsonrpc.NewClient[string](ctx, waiter.Conn, waiter.Reader, list, outputDone)
 }
 
 func getOrCreateContainer(ctx context.Context, cli *client.Client, server DockerServer) (id *string, err error) {

@@ -7,8 +7,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"go-mcp-usa/jsonrpc"
+	"go-mcp-usa/logging"
+	"go-mcp-usa/mcp"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -60,10 +64,54 @@ func main() {
 
 // Get available tools
 func InitMcp() {
-	err := Brave.Setup()
+	client, err := Brave.Setup()
 	if err != nil {
 		fmt.Println("something went wrong: ", err)
 	}
+	message := jsonrpc.Message[string, any]{
+		JSONRPC: "2.0",
+		ID:      "1",
+		Method:  "initialize",
+		Params: jsonrpc.InitializeParams{
+			ProtocolVersion: "0.1.0",
+			ClientInfo: jsonrpc.ClientInfo{
+				Name:    "bach",
+				Version: "1.0.0",
+			},
+			Capabilities: jsonrpc.ClientCapabilities{
+				Tools:     true,
+				Prompts:   false,
+				Resources: true,
+			},
+		},
+	}
+
+	msg1, err := client.SendMessage(message, nil, nil, true)
+	if err != nil {
+		panic(err)
+	}
+	logging.PrintTelemetry(msg1)
+
+	// todo:  implement a call and response pattern here
+	time.Sleep(1 * time.Second)
+	client.SendMessage(jsonrpc.Message[string, any]{
+		JSONRPC: "2.0",
+		ID:      "2",
+		Method:  "tools/list",
+	}, nil, nil, true)
+	time.Sleep(1 * time.Second)
+	client.SendMessage(jsonrpc.Message[string, any]{
+		JSONRPC: "2.0",
+		ID:      "3",
+		Method:  "tools/call",
+		Params: mcp.CallToolRequestParams{
+			Name: "brave_web_search",
+			Arguments: map[string]any{
+				"query": "search the internet for beetles",
+				"count": 100,
+			},
+		},
+	}, nil, nil, true)
 }
 
 func OneShotAnswer(args []string, modePtr *string) {
