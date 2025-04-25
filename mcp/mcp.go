@@ -5,10 +5,8 @@ type Server struct {
 	Env *[]string // environment variables passed to the container
 }
 
-type DockerServer struct {
-	Server
-	ImageName     *string // used if container must be created
-	ContainerName *string // if not specified and ImageName is specified, a new container will be created with a default name
+func (server *Server) Setup() error {
+	return nil
 }
 
 type Client struct {

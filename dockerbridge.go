@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,9 +16,16 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
-func GetOrCreateContainer(server mcp.DockerServer) error {
+type DockerServer struct {
+	mcp.Server
+	ImageName     *string // used if container must be created
+	ContainerName *string // if not specified and ImageName is specified, a new container will be created with a default name
+}
+
+func (server *DockerServer) Setup() error {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -24,7 +33,129 @@ func GetOrCreateContainer(server mcp.DockerServer) error {
 	}
 	defer cli.Close()
 
-	var id *string
+	id, err := getOrCreateContainer(ctx, cli, *server)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(id)
+	err = attachToContainer(ctx, cli, *id)
+	return err
+}
+
+func processContainerOutput(reader io.Reader, stdoutWriter io.Writer, stderrWriter io.Writer, doneCh chan error) {
+	// Create buffers for stdout and stderr
+	stdoutBuf := &bytes.Buffer{}
+	stderrBuf := &bytes.Buffer{}
+
+	// Use stdcopy to handle the Docker multiplexing
+	fmt.Println("test")
+	// _, err := stdcopy.StdCopy(stdoutWriter, stderrWriter, reader)
+	_, err := stdcopy.StdCopy(stdoutBuf, stderrBuf, reader)
+	fmt.Println("test2")
+	if err != nil {
+		doneCh <- fmt.Errorf("error processing container output: %v", err)
+		return
+	}
+
+	// Process stdout for JSON messages
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) == 0 {
+			continue
+		}
+
+		// Try to parse as JSON
+		var jsonData interface{}
+		if err := json.Unmarshal([]byte(line), &jsonData); err != nil {
+			// If not valid JSON, print the raw line
+			fmt.Println(line)
+		} else {
+			// Format the JSON with indentation
+			prettyJSON, err := json.MarshalIndent(jsonData, "", "    ")
+			if err != nil {
+				fmt.Println(line)
+			} else {
+				fmt.Println(string(prettyJSON))
+			}
+		}
+	}
+
+	// Check if there's any stderr content to print
+	if stderrBuf.Len() > 0 {
+		fmt.Fprintf(os.Stderr, "Container stderr: %s\n", stderrBuf.String())
+	}
+
+	doneCh <- scanner.Err()
+}
+func attachToContainer(ctx context.Context, cli *client.Client, id string) error {
+	// Wait for the container to finis
+	// Attach to the container
+	waiter, err := cli.ContainerAttach(ctx, id, container.AttachOptions{
+		Stream: true,
+		Stdin:  true,
+		Stdout: true,
+		Stderr: true,
+	})
+	if err != nil {
+		return err
+	}
+	defer waiter.Close()
+
+	// Set up a goroutine to handle container output
+	outputDone := make(chan error)
+	go processContainerOutput(waiter.Reader, os.Stdout, os.Stderr, outputDone)
+	// go func() {
+	// 	// Use StdCopy to demultiplex the output stream
+	// 	_, err := stdcopy.StdCopy(os.Stdout, os.Stderr, waiter.Reader)
+	// 	outputDone <- err
+	// }()
+	// Create initialization message
+	initMessage := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]interface{}{
+			"protocolVersion": "0.1.0", // Note: "protocolVersion" not "version"
+			"clientInfo": map[string]interface{}{
+				"name":    "bach",
+				"version": "1.0.0",
+			},
+			"capabilities": map[string]interface{}{
+				"tools":     true,
+				"prompts":   false,
+				"resources": true,
+			},
+		},
+	}
+
+	// Marshal to JSON and add newline
+	initMessageJSON, err := json.Marshal(initMessage)
+	if err != nil {
+		return fmt.Errorf("failed to marshal initialization message: %v", err)
+	}
+	initMessageJSON = append(initMessageJSON, '\n')
+
+	// Send the message to the container's stdin
+	if _, err := waiter.Conn.Write(initMessageJSON); err != nil {
+		return fmt.Errorf("failed to send initialization message: %v", err)
+	}
+
+	// Wait for either the output processing to complete or context cancellation
+	select {
+	case err := <-outputDone:
+		if err != nil {
+			return fmt.Errorf("error processing container output: %v", err)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return nil
+}
+
+func getOrCreateContainer(ctx context.Context, cli *client.Client, server DockerServer) (id *string, err error) {
 	var name string
 	var isRunning bool
 	if serverName := server.ContainerName; serverName != nil {
@@ -36,19 +167,19 @@ func GetOrCreateContainer(server mcp.DockerServer) error {
 
 	if isRunning {
 		fmt.Printf("🏹 Running container found with ID: %s\n", *id)
-		return err
+		return id, err
 	}
 
 	if id == nil || err != nil {
-		return err
+		return id, err
 	}
 
 	if err := cli.ContainerStart(ctx, *id, container.StartOptions{}); err != nil {
-		return err
+		return id, err
 	}
 
 	fmt.Printf("🏹 Container started with Name: %s and ID: %s\n", name, *id)
-	return nil
+	return id, err
 }
 
 func printTelemetry[T any](content T) {
