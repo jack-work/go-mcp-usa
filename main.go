@@ -20,20 +20,13 @@ func main() {
 	// Parse flags
 	flag.Parse()
 
+	// init MCP
+	InitMcp()
+
 	// Use the flag value
 	args := flag.Args()
 	if len(args) > 0 {
-		input := strings.Join(args, " ")
-		fmt.Printf("Model: %s\n\n", *modePtr)
-		fmt.Printf("Input: %s\n\n", input)
-		message := NewMessage(input, string(anthropic.MessageParamRoleUser))
-		response, err := SimpleMessage(message)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			return
-		}
-		fmt.Println(response)
-		return
+		OneShotAnswer(args, modePtr)
 	}
 
 	// short buffer to be manually authored and compacted
@@ -43,6 +36,9 @@ func main() {
 	ctx := context.Background()
 	for scanner.Scan() {
 		userPrompt := scanner.Text()
+
+		// add / or tab or . options here; e.g. .help, .session, .agent, or / of the same.
+
 		message := NewMessage(userPrompt, string(anthropic.MessageParamRoleUser))
 		thesis = append(thesis, message)
 
@@ -60,4 +56,26 @@ func main() {
 		fmt.Println()
 		fmt.Print("> ")
 	}
+}
+
+// Get available tools
+func InitMcp() {
+	// err := RegisterServer("mcp/brave-search")
+	// if err != nil {
+	// 	fmt.Println("something went wrong: %w", err)
+	// }
+}
+
+func OneShotAnswer(args []string, modePtr *string) {
+	input := strings.Join(args, " ")
+	fmt.Printf("Model: %s\n\n", *modePtr)
+	fmt.Printf("Input: %s\n\n", input)
+	message := NewMessage(input, string(anthropic.MessageParamRoleUser))
+	response, err := SimpleMessage(message)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	fmt.Println(response)
+	return
 }
