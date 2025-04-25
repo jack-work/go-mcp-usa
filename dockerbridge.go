@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"go-mcp-usa/jsonrpc"
 	"go-mcp-usa/logging"
@@ -113,11 +114,25 @@ func attachToContainer(ctx context.Context, cli *client.Client, id string) error
 	}
 
 	jsonrpc.SendMessage(message, waiter.Conn)
+	// todo:  implement a call and response pattern here
+	time.Sleep(1 * time.Second)
 	jsonrpc.SendMessage(jsonrpc.Message{
 		JSONRPC: "2.0",
 		ID:      2,
-		Method:  "request",
-		Params:  map[string]string{},
+		Method:  "tools/list",
+	}, waiter.Conn)
+	time.Sleep(1 * time.Second)
+	jsonrpc.SendMessage(jsonrpc.Message{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "tools/call",
+		Params: map[string]any{
+			"name": "brave_web_search",
+			"arguments": map[string]string{
+				"query": "search the internet for beetles",
+				"count": "100",
+			},
+		},
 	}, waiter.Conn)
 
 	// Wait for either the output processing to complete or context cancellation
