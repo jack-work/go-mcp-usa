@@ -1,9 +1,14 @@
 package mcp
 
 type Server struct {
-	ImageName   *string
-	ContainerId *string
-	Env         *[]string
+	ID  string
+	Env *[]string // environment variables passed to the container
+}
+
+type DockerServer struct {
+	Server
+	ImageName     *string // used if container must be created
+	ContainerName *string // if not specified and ImageName is specified, a new container will be created with a default name
 }
 
 type Client struct {

@@ -6,68 +6,158 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+
+	"go-mcp-usa/mcp"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
-	"go-mcp-usa/mcp"
 )
 
-type telemetry struct {
-	image.Summary
-	IsSelected bool
-}
-
-func RegisterServer(server mcp.Server) error {
+func GetOrCreateContainer(server mcp.DockerServer) error {
 	ctx := context.Background()
-
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return fmt.Errorf("Docker client could not be created: %w", err)
 	}
 	defer cli.Close()
 
-	imageName := *server.ImageName
-	// Check if image exists by filtering on reference
-	images, err := getImages(ctx, imageName, cli)
-	if err != nil {
+	var id *string
+	var name string
+	var isRunning bool
+	if serverName := server.ContainerName; serverName != nil {
+		id, isRunning, err = getContainerByName(ctx, cli, *serverName)
+		name = *server.ContainerName
+	} else if imgName := server.ImageName; imgName != nil {
+		id, name, isRunning, err = getContainerFromImage(ctx, cli, *imgName, *server.Env)
+	}
+
+	if isRunning {
+		fmt.Printf("🏹 Running container found with ID: %s\n", *id)
 		return err
 	}
 
+	if id == nil || err != nil {
+		return err
+	}
+
+	if err := cli.ContainerStart(ctx, *id, container.StartOptions{}); err != nil {
+		return err
+	}
+
+	fmt.Printf("🏹 Container started with Name: %s and ID: %s\n", name, *id)
+	return nil
+}
+
+func printTelemetry[T any](content T) {
+	telem, err := json.MarshalIndent(content, "", "  ")
+	if err != nil {
+		fmt.Printf("Cannot print telemetry: %w", err)
+	} else {
+		fmt.Println(string(telem))
+	}
+}
+
+func getContainerByName(ctx context.Context, cli *client.Client, name string) (*string, bool, error) {
+	return getContainer(ctx, cli, filters.KeyValuePair{
+		Key:   "name",
+		Value: name,
+	})
+}
+
+func getContainer(ctx context.Context, cli *client.Client, args filters.KeyValuePair) (*string, bool, error) {
+	filters := filters.NewArgs(args)
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		Filters: filters,
+	})
+
+	lenContainers := len(containers)
+	if lenContainers == 0 {
+		return nil, false, err
+	} else if lenContainers > 1 {
+		fmt.Println("Multiple containers found:")
+	}
+
+	printTelemetry(containers)
+	container := &containers[0]
+	return &container.ID, container.State == "running", err
+}
+
+// returns container id and whether it is running or false and error
+func getContainerFromImage(
+	ctx context.Context,
+	cli *client.Client,
+	imageName string,
+	env []string,
+) (
+	id *string,
+	name string,
+	isRunning bool,
+	err error,
+) {
+	name = formatContainerName(imageName)
+
+	// If there is already a container with the expected name then we use it
+	containerId, isRunning, err := getContainerByName(ctx, cli, name)
+	if err != nil || containerId != nil {
+		return containerId, name, isRunning, err
+	}
+
+	// Check if image exists by filtering on reference
+	images, err := getImages(ctx, imageName, cli)
+	if err != nil {
+		return nil, name, false, err
+	}
+
 	if len(images) == 0 {
-		return fmt.Errorf("No docker images found")
+		return nil, name, false, fmt.Errorf("No docker images found")
 	}
 
 	fmt.Printf("📜 Image %s found locally\n", imageName)
 
-	err = logTelemetry(images)
-	if err != nil {
-		return err
-	}
-
+	printTelemetry(images)
 	if len(images) == 0 {
-		return fmt.Errorf("No images found with the provided name: %s", imageName)
+		return nil, name, false, fmt.Errorf("No images found with the provided name: %s", imageName)
 	}
 
-	// We always select the first image...for now
-	image := images[0]
-
-	resp, err := cli.ContainerCreate(ctx, &container.Config{
-		Image: image.ID,
-	}, nil, nil, nil, "")
+	variables, err := getEnvironmentVariables(env)
 	if err != nil {
-		return err
+		return nil, name, false, err
 	}
 
-	fmt.Println(resp)
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return err
-	}
-	fmt.Println("don")
+	// Replace all matches with empty string
+	resp, err := cli.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image:        imageName,
+			Env:          variables,
+			AttachStdin:  true,
+			OpenStdin:    true,
+			StdinOnce:    false,
+			AttachStdout: true,
+			AttachStderr: true,
+			Tty:          false,
+		},
+		&container.HostConfig{
+			AutoRemove: true,
+		},
+		nil,
+		nil,
+		name,
+	)
 
-	fmt.Printf("🏹 Container started with ID: %s\n", resp.ID)
-	return nil
+	id = &resp.ID
+
+	return id, name, false, err
+}
+
+// Pattern matches a letter/digit followed by a letter/digit/underscore/dot/hyphen
+func formatContainerName(imageName string) string {
+	re := regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
+	return re.ReplaceAllString(fmt.Sprintf("mcp-%s", imageName), ".")
 }
 
 // Tries to get the image of the provided image name from the provided client.
@@ -107,18 +197,13 @@ func tryPullImage(ctx context.Context, imageName string, cli *client.Client, fil
 	})
 }
 
-func logTelemetry(images []image.Summary) error {
-	telem := make([]telemetry, len(images))
-	for i, img := range images {
-		telem[i] = telemetry{
-			Summary:    img,
-			IsSelected: i == 0,
+func getEnvironmentVariables(variableNames []string) ([]string, error) {
+	retVal := make([]string, len(variableNames))
+	for i, name := range variableNames {
+		if env := os.Getenv(name); env != "" {
+			fmt.Println(fmt.Sprintf("%s=%s", name, env))
+			retVal[i] = fmt.Sprintf("%s=%s", name, env)
 		}
 	}
-	result, err := json.MarshalIndent(telem, "", "  ")
-	if err != nil {
-		return err
-	}
-	fmt.Println(string(result))
-	return nil
+	return retVal, nil
 }

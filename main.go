@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"go-mcp-usa/servers"
 )
 
 func main() {
@@ -60,10 +61,10 @@ func main() {
 
 // Get available tools
 func InitMcp() {
-	// err := RegisterServer("mcp/brave-search")
-	// if err != nil {
-	// 	fmt.Println("something went wrong: %w", err)
-	// }
+	err := GetOrCreateContainer(servers.Brave)
+	if err != nil {
+		fmt.Println("something went wrong: ", err)
+	}
 }
 
 func OneShotAnswer(args []string, modePtr *string) {
