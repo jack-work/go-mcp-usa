@@ -1,13 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"regexp"
 
-	"go-mcp-usa/jsonrpc"
 	"go-mcp-usa/logging"
 	"go-mcp-usa/mcp"
 
@@ -23,13 +24,19 @@ type DockerServer struct {
 	ContainerName *string // if not specified and ImageName is specified, a new container will be created with a default name
 }
 
-func (server *DockerServer) Setup() (*jsonrpc.Client[string], error) {
+type GenericClient struct {
+	Context  context.Context
+	Conn     net.Conn
+	Reader   *bufio.Reader
+	DoneChan chan error
+}
+
+func (server *DockerServer) Setup() (*GenericClient, error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("Docker client could not be created: %w", err)
 	}
-	defer cli.Close()
 
 	id, err := getOrCreateContainer(ctx, cli, *server)
 	if err != nil {
@@ -39,8 +46,8 @@ func (server *DockerServer) Setup() (*jsonrpc.Client[string], error) {
 	return attachToContainer(ctx, cli, *id)
 }
 
-func attachToContainer(ctx context.Context, cli *client.Client, id string) (*jsonrpc.Client[string], error) {
-	// Wait for the container to finis
+func attachToContainer(ctx context.Context, cli *client.Client, id string) (*GenericClient, error) {
+	// Wait for the container to finish
 	// Attach to the container
 	waiter, err := cli.ContainerAttach(ctx, id, container.AttachOptions{
 		Stream: true,
@@ -51,27 +58,27 @@ func attachToContainer(ctx context.Context, cli *client.Client, id string) (*jso
 	if err != nil {
 		return nil, err
 	}
-	defer waiter.Close()
 
 	// Set up a goroutine to handle container output
 	outputDone := make(chan error)
-
-	telemChan := make(chan jsonrpc.Message[string, any])
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
-				return
-			case result := <-telemChan:
-				logging.PrintTelemetry(result)
+			case err := <-outputDone:
+				if err != nil {
+					logging.PrintTelemetry(err)
+				}
+				cli.Close()
 			}
 		}
 	}()
 
-	list := map[string]chan jsonrpc.Message[string, any]{
-		"*": telemChan,
-	}
-	return jsonrpc.NewClient[string](ctx, waiter.Conn, waiter.Reader, list, outputDone)
+	return &GenericClient{
+		Context:  ctx,
+		Conn:     waiter.Conn,
+		Reader:   waiter.Reader,
+		DoneChan: outputDone,
+	}, nil
 }
 
 func getOrCreateContainer(ctx context.Context, cli *client.Client, server DockerServer) (id *string, err error) {

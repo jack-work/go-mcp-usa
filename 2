@@ -1,0 +1,163 @@
+package jsonrpc
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"go-mcp-usa/logging"
+	"io"
+	"net"
+	"strings"
+	"sync"
+
+	"github.com/google/uuid"
+)
+
+type client[TId any] struct {
+	ctx                   context.Context
+	reader                io.Reader
+	conn                  net.Conn
+	notificaticationChans map[string]chan Message[TId, any]
+	responseChans         map[string]chan Message[TId, any]
+	notLock               *sync.RWMutex
+	resLock               *sync.RWMutex
+}
+
+// optional notification chan for auxiliary messages besides the response
+func (client *client[string]) SendMessage(notificationCh *chan Message[string, any], expectsResponse bool) error {
+	id := uuid.New().String()
+	if expectsResponse {
+		resCh := make(chan Message[string, any])
+		client.resLock.Lock()
+		client.responseChans[id] = resCh
+		client.resLock.Unlock()
+		go func() {
+			for {
+				select {
+				case <-client.ctx.Done():
+					return
+				case response, ok := <-resCh:
+					if !ok {
+						return
+					}
+					logging.PrintTelemetry(response)
+					// release lock
+				}
+			}
+		}()
+	}
+	// wait on lock
+	client.resLock.Lock()
+	client.responseChans[id] = resCh
+	client.resLock.Unlock()
+	return nil
+}
+
+func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader io.Reader, notificationChannels map[string]chan Message[TId, any], doneCh chan error) *client[TId] {
+	main := make(chan Message[TId, any])
+	// Parses the json in the reader
+	go ProcessContainerOutput(reader, main, doneCh)
+
+	notLock, resLock := sync.RWMutex{}, sync.RWMutex{}
+
+	// Pass from the main channel to the response channels
+	// The responseChan can contain type specific wrappers so that we can leverage the mcp in the other folder
+	responseChannels := make(map[TId]chan Message[TId, any], 0)
+	if len(notificationChannels) > 0 {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case response, ok := <-main:
+					if !ok {
+						return
+					}
+					SendChannel(&notLock, notificationChannels, response.Method, response)
+					SendChannel(&resLock, responseChannels, response.ID, response)
+				}
+				// todo: log failure
+			}
+		}()
+	}
+
+	return &client[TId]{
+		ctx:                   ctx,
+		reader:                reader,
+		conn:                  connection,
+		notificaticationChans: notificationChannels,
+		notLock:               &notLock,
+		resLock:               &resLock,
+	}
+}
+
+func SendChannel[TId any, TKey comparable](notLock *sync.RWMutex, chans map[TKey]chan Message[TId, any], key TKey, value Message[TId, any]) {
+	notLock.Unlock()
+	respCh, exists := chans[key]
+	notLock.Lock()
+
+	if exists {
+		select {
+		case respCh <- value:
+		default:
+		}
+	}
+}
+
+func ProcessContainerOutput[TId any](reader io.Reader, responseChan chan Message[TId, any], doneCh chan error) {
+	// Process stdout for JSON messages
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) == 0 {
+			continue
+		}
+		// Remove any non-printable characters at the beginning
+		clean := getCleanLine(line)
+
+		// Try to parse as JSON
+		var response Message[TId, any]
+		if err := json.Unmarshal([]byte(clean), &response); err != nil {
+			fmt.Println(err)
+			doneCh <- scanner.Err()
+		} else {
+			responseChan <- response
+		}
+	}
+
+	doneCh <- scanner.Err()
+}
+
+func getCleanLine(line string) string {
+	if idx := strings.Index(line, "{"); idx != -1 {
+		return line[idx:]
+	} else {
+		return line
+	}
+}
+
+func SendMessage[TId any](message Message[TId, any], conn net.Conn) error {
+	// Marshal to JSON and add newline
+	messageJson, err := json.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("failed to marshal initialization message: %v", err)
+	}
+	messageJson = append(messageJson, '\n')
+
+	// Send the message to the container's stdin
+	if _, err := conn.Write(messageJson); err != nil {
+		return fmt.Errorf("failed to send initialization message: %v", err)
+	}
+
+	return nil
+}
+
+func ReceiveMessages[TId any](responseChan chan Message[TId, any]) {
+	for {
+		select {
+		case response := <-responseChan:
+			logging.PrintTelemetry(response)
+		}
+	}
+}

@@ -64,11 +64,20 @@ func main() {
 
 // Get available tools
 func InitMcp() {
-	client, err := Brave.Setup()
+	genericClient, err := Brave.Setup()
+	client, err := jsonrpc.NewClient[string](
+		genericClient.Context,
+		genericClient.Conn,
+		genericClient.Reader,
+		nil,
+		genericClient.DoneChan)
+
 	if err != nil {
-		fmt.Println("something went wrong: ", err)
+		logging.PrintTelemetry(err)
+		return
 	}
-	message := jsonrpc.Message[string, any]{
+
+	message := jsonrpc.Message[any]{
 		JSONRPC: "2.0",
 		ID:      "1",
 		Method:  "initialize",
@@ -88,19 +97,20 @@ func InitMcp() {
 
 	msg1, err := client.SendMessage(message, nil, nil, true)
 	if err != nil {
-		panic(err)
+		fmt.Println(err)
+		return
 	}
 	logging.PrintTelemetry(msg1)
 
 	// todo:  implement a call and response pattern here
 	time.Sleep(1 * time.Second)
-	client.SendMessage(jsonrpc.Message[string, any]{
+	client.SendMessage(jsonrpc.Message[any]{
 		JSONRPC: "2.0",
 		ID:      "2",
 		Method:  "tools/list",
 	}, nil, nil, true)
 	time.Sleep(1 * time.Second)
-	client.SendMessage(jsonrpc.Message[string, any]{
+	client.SendMessage(jsonrpc.Message[any]{
 		JSONRPC: "2.0",
 		ID:      "3",
 		Method:  "tools/call",
