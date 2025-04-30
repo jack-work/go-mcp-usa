@@ -4,21 +4,54 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go-mcp-usa/logging"
+	"go-mcp-usa/mcp"
 	"os"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/packages/param"
+	"github.com/anthropics/anthropic-sdk-go/shared/constant"
 )
 
-func GetAnthropicMessageParams(message []Message) *anthropic.MessageNewParams {
+func GetAnthropicMessageParams(message []Message, tools []mcp.Tool) *anthropic.MessageNewParams {
 	return &anthropic.MessageNewParams{
 		MaxTokens: 1024,
-		Messages: map2(message, func(msg Message) anthropic.MessageParam {
-			return GetAnthropicMessage(msg)
-		}),
-		Model: anthropic.ModelClaude3_7SonnetLatest,
+		Messages:  GetAnthropicMessages(message),
+		Model:     anthropic.ModelClaude3_7SonnetLatest,
+		Tools:     GetAnthropicTools(tools),
 	}
+}
+
+func GetAnthropicTools(tools []mcp.Tool) []anthropic.ToolUnionParam {
+	anTools := make([]anthropic.ToolUnionParam, len(tools))
+	for idx, val := range tools {
+		anTools[idx] = anthropic.ToolUnionParam{
+			OfTool: &anthropic.ToolParam{
+				Name:        val.Name,
+				InputSchema: GetAnthropicInputSchema(val.InputSchema),
+				Description: param.Opt[string]{
+					Value: *val.Description,
+				},
+			},
+		}
+	}
+
+	return anTools
+}
+
+func GetAnthropicInputSchema(schema mcp.ToolInputSchema) anthropic.ToolInputSchemaParam {
+	return anthropic.ToolInputSchemaParam{
+		Properties: schema.Properties,
+		Type:       constant.Object(schema.Type),
+	}
+}
+
+func GetAnthropicMessages(messages []Message) []anthropic.MessageParam {
+	return map2(messages, func(msg Message) anthropic.MessageParam {
+		return GetAnthropicMessage(msg)
+	})
 }
 
 type AnthropicMessageEnvelope struct {
@@ -46,25 +79,6 @@ func GetAnthropicMessage(message Message) anthropic.MessageParam {
 			OfRequestTextBlock: &anthropic.TextBlockParam{Text: message.GetContent()},
 		}},
 	}
-}
-
-func SimpleMessage(input Message) (Message, error) {
-	client, err := GetAnthropicClient()
-	if err != nil {
-		return nil, err
-	}
-
-	anthropicMessage := GetAnthropicMessageParams([]Message{input})
-	if anthropicMessage == nil {
-		return nil, errors.New(fmt.Sprintf("Bad input, %v", input))
-	}
-
-	message, err := client.Messages.New(context.TODO(), *anthropicMessage)
-	if err != nil {
-		return nil, err
-	}
-
-	return GetMessage(message)
 }
 
 func GetMessage(message *anthropic.Message) (Message, error) {
@@ -98,13 +112,25 @@ func GetAnthropicClient() (*anthropic.Client, error) {
 	return &client, nil
 }
 
-func StreamMessage(input []Message, context context.Context, task func(string) error) (Message, error) {
+func StreamMessage(input []Message, context context.Context, task func(string) error, tools []mcp.Tool) (Message, error) {
+	params := *GetAnthropicMessageParams(input, tools)
+	result, err := StreamMessage2(params, context, task)
+	if err != nil {
+		return nil, err
+	}
+
+	return GetMessage(result)
+}
+
+// newer version that uses built in anthropic types
+func StreamMessage2(input anthropic.MessageNewParams, context context.Context, task func(string) error) (*anthropic.Message, error) {
+	logging.PrintTelemetry(input)
 	client, err := GetAnthropicClient()
 	if err != nil {
 		return nil, err
 	}
 
-	stream := client.Messages.NewStreaming(context, *GetAnthropicMessageParams(input))
+	stream := client.Messages.NewStreaming(context, input)
 	if stream.Err() != nil {
 		fmt.Println(stream.Err())
 		return nil, stream.Err()
@@ -120,9 +146,11 @@ func StreamMessage(input []Message, context context.Context, task func(string) e
 		case anthropic.ContentBlockDeltaEvent:
 			switch deltaVariant := variant.Delta.AsAny().(type) {
 			case anthropic.TextDelta:
-				task(deltaVariant.Text)
+				if task != nil {
+					task(deltaVariant.Text)
+				}
 			}
 		}
 	}
-	return GetMessage(&message)
+	return &message, nil
 }

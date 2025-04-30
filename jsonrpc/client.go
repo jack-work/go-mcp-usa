@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 )
 
-type Client[TId any] struct {
+type Client struct {
 	ctx                   context.Context
 	reader                io.Reader
 	conn                  net.Conn
@@ -26,9 +26,22 @@ type Client[TId any] struct {
 	resLock *sync.RWMutex
 }
 
+func (client *Client) Notify(method string, params any) error {
+	return notifyMessage(Message[any]{JSONRPC: "2.0", Method: method, Params: params}, client.conn)
+}
+
+// Action -> func with no params
+func (client *Client) SendActionMessage(method string) (*Message[any], error) {
+	return client.sendMessage(Message[any]{JSONRPC: "2.0", Method: method})
+}
+
+func (client *Client) SendMessage(method string, params any) (*Message[any], error) {
+	return client.sendMessage(Message[any]{JSONRPC: "2.0", Method: method, Params: params})
+}
+
 // optional notification chan for auxiliary messages besides the response
 // generates an id on behalf of the user if it is not provided
-func (client *Client[string]) SendMessage(message Message[any], notificationCh *chan Message[any], errorChan *chan error, expectsResponse bool) (*Message[any], error) {
+func (client *Client) sendMessage(message Message[any]) (*Message[any], error) {
 	id := uuid.New().String()
 	message.ID = id
 
@@ -44,22 +57,14 @@ func (client *Client[string]) SendMessage(message Message[any], notificationCh *
 		client.resLock.Unlock()
 	}()
 
-	var errCh chan error
-	if errorChan == nil {
-		errCh = make(chan error)
-	} else {
-		errCh = *errorChan
-	}
-
-	// Send request asynchronously
+	errCh := make(chan error)
 	go func() {
-		err := SendMessage(message, client.conn)
+		err := notifyMessage(message, client.conn)
 		if err != nil {
 			errCh <- err
 		}
 	}()
 
-	// Wait with timeout
 	select {
 	case resp := <-resCh:
 		fmt.Println("test")
@@ -71,7 +76,7 @@ func (client *Client[string]) SendMessage(message Message[any], notificationCh *
 	}
 }
 
-func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader io.Reader, notificationChannels map[string]chan Message[any], doneCh chan error) (*Client[TId], error) {
+func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader io.Reader, notificationChannels map[string]chan Message[any], doneCh chan error) (*Client, error) {
 	// One go routine to process the output of the conn, which sends a message over a channel to:
 	// A multiplexer below to fan out to at most three listeners
 	// Listeners may be passed by the caller, or are registered internally to facilitate .
@@ -123,7 +128,7 @@ func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader 
 		}
 	}()
 
-	return &Client[TId]{
+	return &Client{
 		ctx:                   ctx,
 		reader:                reader,
 		conn:                  connection,
@@ -177,7 +182,9 @@ func getCleanLine(line string) string {
 	}
 }
 
-func SendMessage(message Message[any], conn net.Conn) error {
+// Sends a message to the server as a notification.  If a response is expected, channels
+// must be registered ahead of time to look for a response possessing the same id.
+func notifyMessage(message Message[any], conn net.Conn) error {
 	// Marshal to JSON and add newline
 	messageJson, err := json.Marshal(message)
 	if err != nil {

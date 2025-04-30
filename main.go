@@ -12,9 +12,9 @@ import (
 	"go-mcp-usa/mcp"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/mitchellh/mapstructure"
 )
 
 func main() {
@@ -25,12 +25,18 @@ func main() {
 	flag.Parse()
 
 	// init MCP
-	InitMcp()
+	tools, err := InitMcp()
+	if err != nil {
+		logging.PrintTelemetry(err)
+		return
+	}
+	logging.PrintTelemetry(tools)
 
 	// Use the flag value
 	args := flag.Args()
 	if len(args) > 0 {
-		OneShotAnswer(args, modePtr)
+		OneShotAnswer(args, modePtr, tools)
+		return
 	}
 
 	// short buffer to be manually authored and compacted
@@ -49,7 +55,7 @@ func main() {
 		answer, err := StreamMessage(thesis, ctx, func(test string) error {
 			fmt.Printf(test)
 			return nil
-		})
+		}, tools)
 
 		if err != nil {
 			fmt.Printf(err.Error())
@@ -63,7 +69,11 @@ func main() {
 }
 
 // Get available tools
-func InitMcp() {
+// Iff error, []mcp.Tool will be nil
+// Otherwise, []mcp.Tool will always have a non-nil value, even if empty list.
+// If server does not return any tools by responding with nil rather than empty list, that's fine,
+// it's interpreted to mean empty list for interest of compatibility.
+func InitMcp() ([]mcp.Tool, error) {
 	genericClient, err := Brave.Setup()
 	client, err := jsonrpc.NewClient[string](
 		genericClient.Context,
@@ -74,66 +84,53 @@ func InitMcp() {
 
 	if err != nil {
 		logging.PrintTelemetry(err)
-		return
+		return nil, err
 	}
 
-	message := jsonrpc.Message[any]{
-		JSONRPC: "2.0",
-		ID:      "1",
-		Method:  "initialize",
-		Params: jsonrpc.InitializeParams{
-			ProtocolVersion: "0.1.0",
-			ClientInfo: jsonrpc.ClientInfo{
-				Name:    "bach",
-				Version: "1.0.0",
-			},
-			Capabilities: jsonrpc.ClientCapabilities{
-				Tools:     true,
-				Prompts:   false,
-				Resources: true,
-			},
+	res1, err := client.SendMessage("initialize", mcp.InitializeRequestParams{
+		ProtocolVersion: "0.1.0",
+		ClientInfo: mcp.Implementation{
+			Name:    "figaro",
+			Version: "1.0.0",
 		},
-	}
-
-	msg1, err := client.SendMessage(message, nil, nil, true)
+		Capabilities: mcp.ClientCapabilities{},
+	})
 	if err != nil {
 		fmt.Println(err)
-		return
+		return nil, err
 	}
-	logging.PrintTelemetry(msg1)
 
-	// todo:  implement a call and response pattern here
-	time.Sleep(1 * time.Second)
-	client.SendMessage(jsonrpc.Message[any]{
-		JSONRPC: "2.0",
-		ID:      "2",
-		Method:  "tools/list",
-	}, nil, nil, true)
-	time.Sleep(1 * time.Second)
-	client.SendMessage(jsonrpc.Message[any]{
-		JSONRPC: "2.0",
-		ID:      "3",
-		Method:  "tools/call",
-		Params: mcp.CallToolRequestParams{
-			Name: "brave_web_search",
-			Arguments: map[string]any{
-				"query": "search the internet for beetles",
-				"count": 100,
-			},
-		},
-	}, nil, nil, true)
+	logging.PrintTelemetry(res1)
+	err = client.Notify("notifications/initialized", mcp.InitializedNotification{})
+	if err != nil {
+		return nil, err
+	}
+
+	// need to impl pagination
+	untypedToolsResponse, err := client.SendActionMessage("tools/list")
+	if err != nil {
+		return nil, err
+	}
+
+	var toolsResult mcp.ListToolsResult
+	err = mapstructure.Decode(untypedToolsResponse.Result, &toolsResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return toolsResult.Tools, nil
 }
 
-func OneShotAnswer(args []string, modePtr *string) {
+func OneShotAnswer(args []string, modePtr *string, tools []mcp.Tool) {
 	input := strings.Join(args, " ")
 	fmt.Printf("Model: %s\n\n", *modePtr)
 	fmt.Printf("Input: %s\n\n", input)
 	message := NewMessage(input, string(anthropic.MessageParamRoleUser))
-	response, err := SimpleMessage(message)
+	response, err := StreamMessage([]Message{message}, context.Background(), nil, tools)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Println(response)
+	logging.PrintTelemetry(response)
 	return
 }
