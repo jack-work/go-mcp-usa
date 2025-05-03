@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go-mcp-usa/jsonrpc"
@@ -16,6 +17,25 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/mitchellh/mapstructure"
 )
+
+type ServerRegistry interface {
+	GetClient() mcp.Client
+}
+
+type ServerRegistryImpl struct {
+	DockerServers []DockerServer `json:"docker_servers"`
+}
+
+type DockerServer struct {
+	ID            *string   `json:"id"`
+	Env           *[]string `json:"env"`
+	ImageName     *string   // used if container must be created
+	ContainerName *string   // if not specified and ImageName is specified, a new container will be created with a default name
+}
+
+func (s *DockerServer) GetEnv() *[]string {
+	return s.Env
+}
 
 func main() {
 	// Define flag with default value "default_value"
@@ -53,12 +73,12 @@ func main() {
 		thesis = append(thesis, message)
 
 		answer, err := StreamMessage(thesis, ctx, func(test string) error {
-			fmt.Printf(test)
+			fmt.Printf("%s", test)
 			return nil
 		}, tools)
 
 		if err != nil {
-			fmt.Printf(err.Error())
+			logging.PrintTelemetry(err.Error())
 			return
 		}
 
@@ -68,13 +88,40 @@ func main() {
 	}
 }
 
+func GetServers() (*ServerRegistry, error) {
+	// Read the JSON file
+	data, err := os.ReadFile("~/.figaro/servers.json")
+	if err != nil {
+		logging.PrintTelemetry("found file")
+		return nil, err
+	}
+
+	// Unmarshal into struct and add the ID
+	var config ServerRegistry
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
 // Get available tools
 // Iff error, []mcp.Tool will be nil
 // Otherwise, []mcp.Tool will always have a non-nil value, even if empty list.
 // If server does not return any tools by responding with nil rather than empty list, that's fine,
 // it's interpreted to mean empty list for interest of compatibility.
 func InitMcp() ([]mcp.Tool, error) {
-	genericClient, err := Brave.Setup()
+	servers, err := GetServers()
+	if err != nil {
+		logging.PrintTelemetry(err)
+	}
+
+	logging.PrintTelemetry(servers)
+	// llmClient := jsonrpc.Client{
+	// 	Servers: map[string]Server{
+	// 		Brave.
+	// 	}
+	// }
 	client, err := jsonrpc.NewClient[string](
 		genericClient.Context,
 		genericClient.Conn,
@@ -126,11 +173,30 @@ func OneShotAnswer(args []string, modePtr *string, tools []mcp.Tool) {
 	fmt.Printf("Model: %s\n\n", *modePtr)
 	fmt.Printf("Input: %s\n\n", input)
 	message := NewMessage(input, string(anthropic.MessageParamRoleUser))
-	response, err := StreamMessage([]Message{message}, context.Background(), nil, tools)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
+	anthropicTools := GetAnthropicTools(tools)
+	role := anthropic.MessageParamRole(string(anthropic.MessageParamRoleUser))
+	for range 1 {
+		test := &anthropic.MessageNewParams{
+			MaxTokens: 1024,
+			Messages: []anthropic.MessageParam{{
+				Content: []anthropic.ContentBlockParamUnion{{
+					OfRequestTextBlock: &anthropic.TextBlockParam{Text: message.GetContent()},
+				}},
+				Role: role,
+			}},
+			Model: anthropic.ModelClaude3_7SonnetLatest,
+			Tools: anthropicTools,
+		}
+		response, err := StreamMessage2(*test, context.Background(), func(test string) error {
+			fmt.Print(test)
+			return nil
+		})
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return
+		}
+		switch response.Content.AsAny().(type) {
+
+		}
 	}
-	logging.PrintTelemetry(response)
-	return
 }

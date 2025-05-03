@@ -146,9 +146,7 @@ func StreamMessage2(input anthropic.MessageNewParams, context context.Context, t
 		case anthropic.ContentBlockDeltaEvent:
 			switch deltaVariant := variant.Delta.AsAny().(type) {
 			case anthropic.TextDelta:
-				if task != nil {
-					task(deltaVariant.Text)
-				}
+				task(deltaVariant.Text)
 			}
 		}
 	}

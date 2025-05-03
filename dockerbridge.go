@@ -10,19 +10,12 @@ import (
 	"regexp"
 
 	"go-mcp-usa/logging"
-	"go-mcp-usa/mcp"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 )
-
-type DockerServer struct {
-	mcp.Server
-	ImageName     *string // used if container must be created
-	ContainerName *string // if not specified and ImageName is specified, a new container will be created with a default name
-}
 
 type GenericClient struct {
 	Context  context.Context

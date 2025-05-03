@@ -22,8 +22,7 @@ type Client struct {
 	notificaticationChans map[string]chan Message[any]
 	responseChans         map[string]chan Message[any]
 	notLock               *sync.RWMutex
-	// Do I need this?  I don't think I ever change this and I don't remember why I added it
-	resLock *sync.RWMutex
+	resLock               *sync.RWMutex
 }
 
 func (client *Client) Notify(method string, params any) error {

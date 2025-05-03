@@ -1,14 +1,16 @@
 package mcp
 
-type Server struct {
-	ID  string
-	Env *[]string // environment variables passed to the container
-}
+import (
+	"go-mcp-usa/jsonrpc"
+)
 
-func (server *Server) Setup() error {
-	return nil
+type Server interface {
+	GetID() string
+	GetEnv() *[]string
+	Setup() error
 }
 
 type Client struct {
-	Servers map[string]Server
+	TargetServer Server
+	jsonrpc.Client
 }
