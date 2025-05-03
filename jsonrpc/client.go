@@ -15,7 +15,14 @@ import (
 	"github.com/google/uuid"
 )
 
-type Client struct {
+type Client interface {
+	Notify(method string, params any) error
+	SendActionMessage(method string) (*Message[any], error)
+	SendMesage(method string, params any)
+}
+
+type StdioClient struct {
+	GenericStdioClient
 	ctx                   context.Context
 	reader                io.Reader
 	conn                  net.Conn
@@ -25,22 +32,29 @@ type Client struct {
 	resLock               *sync.RWMutex
 }
 
-func (client *Client) Notify(method string, params any) error {
+type GenericStdioClient struct {
+	Context context.Context
+	Conn    net.Conn
+	Reader  *bufio.Reader
+	DoneCh  chan error
+}
+
+func (client StdioClient) Notify(method string, params any) error {
 	return notifyMessage(Message[any]{JSONRPC: "2.0", Method: method, Params: params}, client.conn)
 }
 
 // Action -> func with no params
-func (client *Client) SendActionMessage(method string) (*Message[any], error) {
+func (client StdioClient) SendActionMessage(method string) (*Message[any], error) {
 	return client.sendMessage(Message[any]{JSONRPC: "2.0", Method: method})
 }
 
-func (client *Client) SendMessage(method string, params any) (*Message[any], error) {
+func (client StdioClient) SendMessage(method string, params any) (*Message[any], error) {
 	return client.sendMessage(Message[any]{JSONRPC: "2.0", Method: method, Params: params})
 }
 
 // optional notification chan for auxiliary messages besides the response
 // generates an id on behalf of the user if it is not provided
-func (client *Client) sendMessage(message Message[any]) (*Message[any], error) {
+func (client *StdioClient) sendMessage(message Message[any]) (*Message[any], error) {
 	id := uuid.New().String()
 	message.ID = id
 
@@ -75,7 +89,7 @@ func (client *Client) sendMessage(message Message[any]) (*Message[any], error) {
 	}
 }
 
-func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader io.Reader, notificationChannels map[string]chan Message[any], doneCh chan error) (*Client, error) {
+func NewClient[TId comparable](client *GenericStdioClient) (*StdioClient, error) {
 	// One go routine to process the output of the conn, which sends a message over a channel to:
 	// A multiplexer below to fan out to at most three listeners
 	// Listeners may be passed by the caller, or are registered internally to facilitate .
@@ -83,13 +97,10 @@ func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader 
 	// This is so to allow responses, listeners to which we expect to be fewer than those to notifications, be processed first
 	// before iterating over notification channels.  This optimization may be premature, as it might take a while to
 	// use this library in a sufficiently intense setting, but that's the way I wrote it so it's what we have for now.
-
-	if notificationChannels == nil {
-		notificationChannels = make(map[string]chan Message[any])
-	}
+	notificationChannels := make(map[string]chan Message[any])
 	main := make(chan Message[any])
 	// Parses the json in the reader
-	go processOutput(reader, main, doneCh)
+	go processOutput(client.Reader, main, client.DoneCh)
 
 	notLock, resLock := sync.RWMutex{}, sync.RWMutex{}
 
@@ -97,7 +108,7 @@ func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader 
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-client.Context.Done():
 				return
 			case result := <-telemChan:
 				logging.PrintTelemetry(result)
@@ -112,7 +123,7 @@ func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader 
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-client.Context.Done():
 				return
 			case response, ok := <-main:
 				if !ok {
@@ -127,10 +138,11 @@ func NewClient[TId comparable](ctx context.Context, connection net.Conn, reader 
 		}
 	}()
 
-	return &Client{
-		ctx:                   ctx,
-		reader:                reader,
-		conn:                  connection,
+	return &StdioClient{
+		GenericStdioClient:    *client,
+		ctx:                   client.Context,
+		reader:                client.Reader,
+		conn:                  client.Conn,
 		notificaticationChans: notificationChannels,
 		notLock:               &notLock,
 		resLock:               &resLock,

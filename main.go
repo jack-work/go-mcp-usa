@@ -12,28 +12,62 @@ import (
 	"go-mcp-usa/logging"
 	"go-mcp-usa/mcp"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/mitchellh/mapstructure"
 )
 
-type ServerRegistry interface {
-	GetClient() mcp.Client
+type Figaro struct {
+	Clients []mcp.Client
+	// Might get stale when we implement dynamic tool introduction
+	toolsCache []mcp.Tool
 }
 
-type ServerRegistryImpl struct {
+func (figaro Figaro) GetClientForTool(toolName string) *mcp.Client {
+	for _, client := range figaro.Clients {
+		for _, tool := range client.Tools {
+			if tool.Name == toolName {
+				return &client
+			}
+		}
+	}
+	return nil
+}
+
+func (figaro Figaro) GetAllTools() []mcp.Tool {
+	logging.PrintTelemetry(figaro.Clients[0])
+	if figaro.toolsCache != nil {
+		return figaro.toolsCache
+	}
+	cumToolSize := 0
+	for _, client := range figaro.Clients {
+		cumToolSize += len(client.Tools)
+	}
+	result := make([]mcp.Tool, cumToolSize)
+	for i, client := range figaro.Clients {
+		for j, tool := range client.Tools {
+			result[i+j] = tool
+		}
+	}
+	figaro.toolsCache = result
+	return result
+}
+
+type ServerRegistry struct {
 	DockerServers []DockerServer `json:"docker_servers"`
 }
 
 type DockerServer struct {
-	ID            *string   `json:"id"`
-	Env           *[]string `json:"env"`
-	ImageName     *string   // used if container must be created
-	ContainerName *string   // if not specified and ImageName is specified, a new container will be created with a default name
+	ID  *string   `json:"id"`
+	Env *[]string `json:"env"`
+	// used if container must be created
+	ImageName *string `json:"image_name"`
+	// if not specified and ImageName is specified, a new container will be created with a default name
+	ContainerName *string `json:"container_name"`
 }
 
-func (s *DockerServer) GetEnv() *[]string {
+func (s DockerServer) GetEnv() *[]string {
 	return s.Env
 }
 
@@ -45,17 +79,20 @@ func main() {
 	flag.Parse()
 
 	// init MCP
-	tools, err := InitMcp()
+	servers, err := GetServers()
+	if err != nil {
+		logging.PrintTelemetry(err)
+	}
+	figaro, err := SummonFigaro(*servers)
 	if err != nil {
 		logging.PrintTelemetry(err)
 		return
 	}
-	logging.PrintTelemetry(tools)
 
 	// Use the flag value
 	args := flag.Args()
 	if len(args) > 0 {
-		OneShotAnswer(args, modePtr, tools)
+		OneShotAnswer(args, modePtr, figaro)
 		return
 	}
 
@@ -75,7 +112,7 @@ func main() {
 		answer, err := StreamMessage(thesis, ctx, func(test string) error {
 			fmt.Printf("%s", test)
 			return nil
-		}, tools)
+		}, figaro.GetAllTools())
 
 		if err != nil {
 			logging.PrintTelemetry(err.Error())
@@ -89,10 +126,14 @@ func main() {
 }
 
 func GetServers() (*ServerRegistry, error) {
-	// Read the JSON file
-	data, err := os.ReadFile("~/.figaro/servers.json")
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		logging.PrintTelemetry("found file")
+		return nil, err
+	}
+	filePath := filepath.Join(homeDir, ".figaro", "servers.json")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		logging.PrintTelemetry(err)
 		return nil, err
 	}
 
@@ -105,98 +146,152 @@ func GetServers() (*ServerRegistry, error) {
 	return &config, nil
 }
 
-// Get available tools
-// Iff error, []mcp.Tool will be nil
-// Otherwise, []mcp.Tool will always have a non-nil value, even if empty list.
-// If server does not return any tools by responding with nil rather than empty list, that's fine,
+// Initializes an instance of a Figaro application configured with the provided server list, and returns it.
+// Iff error, return val will be nil
+// Otherwise, it will always have a non-nil value, even if empty list.
+// If server does not return any tools by responding with nil tools in result rather than empty list, that's fine,
 // it's interpreted to mean empty list for interest of compatibility.
-func InitMcp() ([]mcp.Tool, error) {
-	servers, err := GetServers()
-	if err != nil {
-		logging.PrintTelemetry(err)
+func SummonFigaro(servers ServerRegistry) (*Figaro, error) {
+	mcpClients := make([]mcp.Client, len(servers.DockerServers))
+	for i, server := range servers.DockerServers {
+		genericClient, err := server.Setup()
+		if err != nil {
+			return nil, err
+		}
+		client, err := jsonrpc.NewClient[string](genericClient)
+		if err != nil {
+			return nil, err
+		}
+		mcpClient := mcp.Client{
+			TargetServer: server,
+			StdioClient:  *client,
+		}
+		err = mcpClient.Initialize()
+		if err != nil {
+			return nil, err
+		}
+		mcpClients[i] = mcpClient
 	}
 
-	logging.PrintTelemetry(servers)
-	// llmClient := jsonrpc.Client{
-	// 	Servers: map[string]Server{
-	// 		Brave.
-	// 	}
-	// }
-	client, err := jsonrpc.NewClient[string](
-		genericClient.Context,
-		genericClient.Conn,
-		genericClient.Reader,
-		nil,
-		genericClient.DoneChan)
-
-	if err != nil {
-		logging.PrintTelemetry(err)
-		return nil, err
-	}
-
-	res1, err := client.SendMessage("initialize", mcp.InitializeRequestParams{
-		ProtocolVersion: "0.1.0",
-		ClientInfo: mcp.Implementation{
-			Name:    "figaro",
-			Version: "1.0.0",
-		},
-		Capabilities: mcp.ClientCapabilities{},
-	})
-	if err != nil {
-		fmt.Println(err)
-		return nil, err
-	}
-
-	logging.PrintTelemetry(res1)
-	err = client.Notify("notifications/initialized", mcp.InitializedNotification{})
-	if err != nil {
-		return nil, err
-	}
-
-	// need to impl pagination
-	untypedToolsResponse, err := client.SendActionMessage("tools/list")
-	if err != nil {
-		return nil, err
-	}
-
-	var toolsResult mcp.ListToolsResult
-	err = mapstructure.Decode(untypedToolsResponse.Result, &toolsResult)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return toolsResult.Tools, nil
+	return &Figaro{
+		Clients: mcpClients,
+	}, nil
 }
 
-func OneShotAnswer(args []string, modePtr *string, tools []mcp.Tool) {
+func OneShotAnswer(args []string, modePtr *string, figaro *Figaro) error {
+	tools := figaro.GetAllTools()
 	input := strings.Join(args, " ")
 	fmt.Printf("Model: %s\n\n", *modePtr)
 	fmt.Printf("Input: %s\n\n", input)
 	message := NewMessage(input, string(anthropic.MessageParamRoleUser))
-	anthropicTools := GetAnthropicTools(tools)
+	logging.PrintTelemetry(tools)
+	logging.PrintTelemetry("yup")
 	role := anthropic.MessageParamRole(string(anthropic.MessageParamRoleUser))
+
+	conversation := make([]anthropic.MessageParam, 0, 1)
 	for range 1 {
-		test := &anthropic.MessageNewParams{
-			MaxTokens: 1024,
-			Messages: []anthropic.MessageParam{{
-				Content: []anthropic.ContentBlockParamUnion{{
-					OfRequestTextBlock: &anthropic.TextBlockParam{Text: message.GetContent()},
-				}},
-				Role: role,
+		conversation = append(conversation, anthropic.MessageParam{
+			Content: []anthropic.ContentBlockParamUnion{{
+				OfRequestTextBlock: &anthropic.TextBlockParam{Text: message.GetContent()},
 			}},
-			Model: anthropic.ModelClaude3_7SonnetLatest,
-			Tools: anthropicTools,
-		}
-		response, err := StreamMessage2(*test, context.Background(), func(test string) error {
+			Role: role,
+		})
+		messageParams := GetMessageNewParams(conversation, tools)
+		message, err := StreamMessage2(*messageParams, context.Background(), func(test string) error {
 			fmt.Print(test)
 			return nil
 		})
+
+		modelResponse := make([]anthropic.ContentBlockParamUnion, 0, len(message.Content))
+		for _, message := range message.Content {
+			modelResponse = append(modelResponse, message.ToParam())
+		}
+		conversation = append(conversation, anthropic.MessageParam{
+			Content: modelResponse,
+			Role:    anthropic.MessageParamRoleAssistant,
+		})
+
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
-			return
+			return err
 		}
-		switch response.Content.AsAny().(type) {
+		if message.StopReason == "tool_use" {
+			toolResponses, err := callTools(message, figaro)
+			if err != nil {
+				return err
+			}
+			toolResults := make([]anthropic.ContentBlockParamUnion, 0)
+			for _, toolResponse := range toolResponses {
+				toolResults = append(toolResults, anthropic.ContentBlockParamUnion{
+					OfRequestToolResultBlock: &anthropic.ToolResultBlockParam{
+						ToolUseID: toolResponse.ID,
+						Content: []anthropic.ToolResultBlockParamContentUnion{{
+							OfRequestTextBlock: &anthropic.TextBlockParam{
+								Text: anyToString(toolResponse.Result),
+							},
+						}},
+					},
+				})
+			}
+			conversation = append(conversation, anthropic.MessageParam{
+				Content: toolResults,
+				Role:    anthropic.MessageParamRoleUser,
+			})
+			logging.PrintTelemetry(conversation)
+		}
+	}
 
+	return nil
+}
+
+func GetMessageNewParams(conversation []anthropic.MessageParam, tools []mcp.Tool) *anthropic.MessageNewParams {
+	anthropicTools := GetAnthropicTools(tools)
+	messageParams := &anthropic.MessageNewParams{
+		MaxTokens: 1024,
+		Messages:  conversation,
+		Model:     anthropic.ModelClaude3_7SonnetLatest,
+		Tools:     anthropicTools,
+	}
+	return messageParams
+}
+
+func callTools(message *anthropic.Message, figaro *Figaro) ([]jsonrpc.Message[any], error) {
+	tools := make([]jsonrpc.Message[any], 0, len(message.Content))
+	for _, block := range message.Content {
+		switch variant := block.AsAny().(type) {
+		case anthropic.ToolUseBlock:
+			client := figaro.GetClientForTool(variant.Name)
+			if client == nil {
+				return nil, fmt.Errorf("Could not find mcp client for %v", variant.Name)
+			}
+			var args map[string]any
+			err := json.Unmarshal(variant.Input, &args)
+			if err != nil {
+				return nil, err
+			}
+			response, err := client.SendMessage("tools/call", mcp.CallToolRequestParams{
+				Name:      variant.Name,
+				Arguments: args,
+			})
+			if err != nil {
+				return nil, err
+			}
+			logging.PrintTelemetry(response)
+			tools = append(tools, *response)
 		}
+	}
+	return tools, nil
+}
+
+// Converting to string
+func anyToString(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case map[string]any, []any:
+		bytes, _ := json.Marshal(val)
+		return string(bytes)
+	default:
+		return fmt.Sprintf("%v", val)
 	}
 }

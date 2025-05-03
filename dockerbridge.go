@@ -1,14 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"regexp"
 
+	"go-mcp-usa/jsonrpc"
 	"go-mcp-usa/logging"
 
 	"github.com/docker/docker/api/types/container"
@@ -17,29 +16,23 @@ import (
 	"github.com/docker/docker/client"
 )
 
-type GenericClient struct {
-	Context  context.Context
-	Conn     net.Conn
-	Reader   *bufio.Reader
-	DoneChan chan error
-}
-
-func (server *DockerServer) Setup() (*GenericClient, error) {
+func (server DockerServer) Setup() (*jsonrpc.GenericStdioClient, error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("Docker client could not be created: %w", err)
 	}
 
-	id, err := getOrCreateContainer(ctx, cli, *server)
+	id, err := getOrCreateContainer(ctx, cli, server)
 	if err != nil {
 		return nil, err
 	}
 
+	logging.PrintTelemetry(id)
 	return attachToContainer(ctx, cli, *id)
 }
 
-func attachToContainer(ctx context.Context, cli *client.Client, id string) (*GenericClient, error) {
+func attachToContainer(ctx context.Context, cli *client.Client, id string) (*jsonrpc.GenericStdioClient, error) {
 	// Wait for the container to finish
 	// Attach to the container
 	waiter, err := cli.ContainerAttach(ctx, id, container.AttachOptions{
@@ -66,11 +59,11 @@ func attachToContainer(ctx context.Context, cli *client.Client, id string) (*Gen
 		}
 	}()
 
-	return &GenericClient{
-		Context:  ctx,
-		Conn:     waiter.Conn,
-		Reader:   waiter.Reader,
-		DoneChan: outputDone,
+	return &jsonrpc.GenericStdioClient{
+		Context: ctx,
+		Conn:    waiter.Conn,
+		Reader:  waiter.Reader,
+		DoneCh:  outputDone,
 	}, nil
 }
 

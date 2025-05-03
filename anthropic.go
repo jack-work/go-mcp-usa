@@ -7,6 +7,7 @@ import (
 	"go-mcp-usa/logging"
 	"go-mcp-usa/mcp"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -142,13 +143,17 @@ func StreamMessage2(input anthropic.MessageNewParams, context context.Context, t
 		if err != nil {
 			panic(err)
 		}
+
 		switch variant := event.AsAny().(type) {
 		case anthropic.ContentBlockDeltaEvent:
 			switch deltaVariant := variant.Delta.AsAny().(type) {
 			case anthropic.TextDelta:
 				task(deltaVariant.Text)
+			default:
+				task(reflect.TypeOf(deltaVariant).Name() + "\n")
 			}
 		}
 	}
+
 	return &message, nil
 }
