@@ -221,10 +221,10 @@ func OneShotAnswer(args []string, modePtr *string, figaro *Figaro) error {
 				return err
 			}
 			toolResults := make([]anthropic.ContentBlockParamUnion, 0)
-			for _, toolResponse := range toolResponses {
+			for id, toolResponse := range toolResponses {
 				toolResults = append(toolResults, anthropic.ContentBlockParamUnion{
 					OfRequestToolResultBlock: &anthropic.ToolResultBlockParam{
-						ToolUseID: toolResponse.ID,
+						ToolUseID: id,
 						Content: []anthropic.ToolResultBlockParamContentUnion{{
 							OfRequestTextBlock: &anthropic.TextBlockParam{
 								Text: anyToString(toolResponse.Result),
@@ -237,8 +237,33 @@ func OneShotAnswer(args []string, modePtr *string, figaro *Figaro) error {
 				Content: toolResults,
 				Role:    anthropic.MessageParamRoleUser,
 			})
-			logging.PrintTelemetry(conversation)
+
+			messageParams = GetMessageNewParams(conversation, tools)
+			message, err := StreamMessage2(*messageParams, context.Background(), func(test string) error {
+				fmt.Print(test)
+				return nil
+			})
+
+			writeHostFile(conversation, ".conversation.json")
+			logging.PrintTelemetry(message)
 		}
+	}
+
+	return nil
+}
+
+func writeHostFile(contents any, path ...string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	relative := filepath.Join(path...)
+	filePath := filepath.Join(homeDir, relative)
+	byteContents, err := json.Marshal(contents)
+	err = os.WriteFile(filePath, byteContents, os.FileMode(os.O_TRUNC))
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -255,8 +280,8 @@ func GetMessageNewParams(conversation []anthropic.MessageParam, tools []mcp.Tool
 	return messageParams
 }
 
-func callTools(message *anthropic.Message, figaro *Figaro) ([]jsonrpc.Message[any], error) {
-	tools := make([]jsonrpc.Message[any], 0, len(message.Content))
+func callTools(message *anthropic.Message, figaro *Figaro) (map[string]jsonrpc.Message[any], error) {
+	tools := make(map[string]jsonrpc.Message[any], len(message.Content))
 	for _, block := range message.Content {
 		switch variant := block.AsAny().(type) {
 		case anthropic.ToolUseBlock:
@@ -277,7 +302,7 @@ func callTools(message *anthropic.Message, figaro *Figaro) ([]jsonrpc.Message[an
 				return nil, err
 			}
 			logging.PrintTelemetry(response)
-			tools = append(tools, *response)
+			tools[variant.ID] = *response
 		}
 	}
 	return tools, nil
