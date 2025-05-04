@@ -2,8 +2,8 @@ package mcp
 
 import (
 	"fmt"
-	"go-mcp-usa/jsonrpc"
-	"go-mcp-usa/logging"
+	"figaro/jsonrpc"
+	"figaro/logging"
 
 	"github.com/mitchellh/mapstructure"
 )

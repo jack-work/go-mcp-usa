@@ -1,6 +1,6 @@
 package main
 
-// import "go-mcp-usa/mcp"
+// import "figaro/mcp"
 
 var braveImageName = "mcp/brave-search"
 

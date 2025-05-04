@@ -7,8 +7,8 @@ import (
 	"os"
 	"regexp"
 
-	"go-mcp-usa/jsonrpc"
-	"go-mcp-usa/logging"
+	"figaro/jsonrpc"
+	"figaro/logging"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"

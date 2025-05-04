@@ -1,4 +1,4 @@
-module go-mcp-usa
+module figaro
 
 go 1.24.2
 
