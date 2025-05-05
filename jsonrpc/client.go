@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"figaro/logging"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -22,8 +22,6 @@ type Client interface {
 }
 
 type StdioClient struct {
-	GenericStdioClient
-	ctx                   context.Context
 	reader                io.Reader
 	conn                  net.Conn
 	notificaticationChans map[string]chan Message[any]
@@ -32,11 +30,9 @@ type StdioClient struct {
 	resLock               *sync.RWMutex
 }
 
-type GenericStdioClient struct {
-	Context context.Context
-	Conn    net.Conn
-	Reader  *bufio.Reader
-	DoneCh  chan error
+type Connection struct {
+	Conn   net.Conn
+	Reader *bufio.Reader
 }
 
 func (client StdioClient) Notify(method string, params any) error {
@@ -89,7 +85,8 @@ func (client *StdioClient) sendMessage(message Message[any]) (*Message[any], err
 	}
 }
 
-func NewClient[TId comparable](client *GenericStdioClient) (*StdioClient, error) {
+func NewStdioClient[TId comparable](ctx context.Context, client *Connection) (*StdioClient, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
 	// One go routine to process the output of the conn, which sends a message over a channel to:
 	// A multiplexer below to fan out to at most three listeners
 	// Listeners may be passed by the caller, or are registered internally to facilitate .
@@ -99,8 +96,9 @@ func NewClient[TId comparable](client *GenericStdioClient) (*StdioClient, error)
 	// use this library in a sufficiently intense setting, but that's the way I wrote it so it's what we have for now.
 	notificationChannels := make(map[string]chan Message[any])
 	main := make(chan Message[any])
+
 	// Parses the json in the reader
-	go processOutput(client.Reader, main, client.DoneCh)
+	go processOutput(client.Reader, main, cancel)
 
 	notLock, resLock := sync.RWMutex{}, sync.RWMutex{}
 
@@ -108,7 +106,7 @@ func NewClient[TId comparable](client *GenericStdioClient) (*StdioClient, error)
 	go func() {
 		for {
 			select {
-			case <-client.Context.Done():
+			case <-ctx.Done():
 				return
 			case result := <-telemChan:
 				logging.PrintTelemetry(result)
@@ -123,7 +121,7 @@ func NewClient[TId comparable](client *GenericStdioClient) (*StdioClient, error)
 	go func() {
 		for {
 			select {
-			case <-client.Context.Done():
+			case <-ctx.Done():
 				return
 			case response, ok := <-main:
 				if !ok {
@@ -139,8 +137,6 @@ func NewClient[TId comparable](client *GenericStdioClient) (*StdioClient, error)
 	}()
 
 	return &StdioClient{
-		GenericStdioClient:    *client,
-		ctx:                   client.Context,
 		reader:                client.Reader,
 		conn:                  client.Conn,
 		notificaticationChans: notificationChannels,
@@ -161,7 +157,12 @@ func SendChannel(notLock *sync.RWMutex, chans map[string]chan Message[any], key 
 	}
 }
 
-func processOutput(reader io.Reader, responseChan chan Message[any], doneCh chan error) {
+// if the reader dies, Scan will return false and this will fail.
+// probably should run the scanner in a for select and handle ctx failure appropriately.
+// this works for now, so TODO:
+// probably can do something with timeout where every successful scan resets the timeout, otherwise
+// cancel is called
+func processOutput(reader io.Reader, responseChan chan Message[any], cancel context.CancelCauseFunc) {
 	// Process stdout for JSON messages
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
@@ -176,13 +177,13 @@ func processOutput(reader io.Reader, responseChan chan Message[any], doneCh chan
 		var response Message[any]
 		if err := json.Unmarshal([]byte(clean), &response); err != nil {
 			fmt.Println(err)
-			doneCh <- scanner.Err()
+			cancel(scanner.Err())
 		} else {
 			responseChan <- response
 		}
 	}
 
-	doneCh <- scanner.Err()
+	cancel(scanner.Err())
 }
 
 func getCleanLine(line string) string {

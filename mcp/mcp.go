@@ -1,9 +1,10 @@
 package mcp
 
 import (
-	"fmt"
+	"context"
 	"figaro/jsonrpc"
 	"figaro/logging"
+	"fmt"
 
 	"github.com/mitchellh/mapstructure"
 )
@@ -16,6 +17,10 @@ type Client struct {
 	TargetServer        Server
 	Tools               []Tool
 	jsonrpc.StdioClient `json:"-"`
+	ConnectionDone      <-chan error
+	CancelConnection    context.CancelFunc
+	RpcDone             <-chan error
+	CancelRpc           context.CancelFunc
 }
 
 // executes mcp handshake and initializes tools
