@@ -4,3 +4,6 @@
 - For now it works.
 
 - Immediate next steps are to handle tool use and implement a loop in the one shot message
+
+> [!IMPORTANT]
+> Implement decorator pattern for logging

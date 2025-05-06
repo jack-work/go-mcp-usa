@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -50,7 +51,7 @@ func SummonFigaro(ctx context.Context, tp trace.TracerProvider, servers ServerRe
 
 		// child context for client
 		rpcCtx, cancelRpc := context.WithCancel(serviceContext)
-		client, rpcDone, err := jsonrpc.NewStdioClient[string](rpcCtx, connection)
+		client, rpcDone, err := jsonrpc.NewStdioClient[string](rpcCtx, connection, tp)
 		if err != nil {
 			cancelConn()
 			cancelRpc()
@@ -65,7 +66,7 @@ func SummonFigaro(ctx context.Context, tp trace.TracerProvider, servers ServerRe
 			CancelRpc:        cancelRpc,
 			TracerProvider:   tp,
 		}
-		err = mcpClient.Initialize()
+		err = mcpClient.Initialize(ctx)
 		if err != nil {
 			cancelConn()
 			cancelRpc()
@@ -111,10 +112,19 @@ func (figaro *Figaro) GetAllTools() []mcp.Tool {
 }
 
 func (figaro *Figaro) Request(args []string, modePtr *string) error {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(ctx.Err())
+
+	tracer := figaro.tracerProvider.Tracer("figaro")
+	ctx, span := tracer.Start(ctx, "request")
+	defer span.End()
+
 	tools := figaro.GetAllTools()
 	input := strings.Join(args, " ")
 
-	logging.EzPrint(tools)
+	span.AddEvent("Tools retrieved",
+		trace.WithAttributes(attribute.String("serialized_tools", logging.EzMarshal(tools))))
+
 	role := anthropic.MessageParamRole(string(anthropic.MessageParamRoleUser))
 
 	conversation := make([]anthropic.MessageParam, 0, 1)
@@ -141,14 +151,14 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 		})
 
 		if err != nil {
-			fmt.Printf("Error: %v\n", err)
 			return err
 		}
-		if message.StopReason == "tool_use" {
-			toolResponses, err := callTools(message, figaro)
+		for message.StopReason == "tool_use" {
+			toolResponses, err := callTools(ctx, message, figaro)
 			if err != nil {
 				return err
 			}
+
 			toolResults := make([]anthropic.ContentBlockParamUnion, 0)
 			for id, toolResponse := range toolResponses {
 				toolResults = append(toolResults, anthropic.ContentBlockParamUnion{
@@ -162,20 +172,21 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 					},
 				})
 			}
+
 			conversation = append(conversation, anthropic.MessageParam{
 				Content: toolResults,
 				Role:    anthropic.MessageParamRoleUser,
 			})
 
 			messageParams = GetMessageNewParams(conversation, tools)
-			message, err := anthropicbridge.StreamMessage2(*messageParams, context.Background(), func(test string) error {
+			message, err = anthropicbridge.StreamMessage2(*messageParams, context.Background(), func(test string) error {
+				// TODO: Formalize the console channel and extent it to add formatting, etc.
 				fmt.Print(test)
 				return nil
 			})
-
-			writeHostFile(conversation, ".conversation.json")
-			logging.EzPrint(message)
 		}
+
+		writeHostFile(conversation, ".conversation.json")
 	}
 
 	return nil
@@ -209,7 +220,7 @@ func GetMessageNewParams(conversation []anthropic.MessageParam, tools []mcp.Tool
 	return messageParams
 }
 
-func callTools(message *anthropic.Message, figaro *Figaro) (map[string]jsonrpc.Message[any], error) {
+func callTools(ctx context.Context, message *anthropic.Message, figaro *Figaro) (map[string]jsonrpc.Message[any], error) {
 	tools := make(map[string]jsonrpc.Message[any], len(message.Content))
 	for _, block := range message.Content {
 		switch variant := block.AsAny().(type) {
@@ -223,14 +234,16 @@ func callTools(message *anthropic.Message, figaro *Figaro) (map[string]jsonrpc.M
 			if err != nil {
 				return nil, err
 			}
-			response, err := client.SendMessage("tools/call", mcp.CallToolRequestParams{
-				Name:      variant.Name,
-				Arguments: args,
-			})
+			response, err := client.SendMessage(
+				ctx,
+				"tools/call",
+				mcp.CallToolRequestParams{
+					Name:      variant.Name,
+					Arguments: args,
+				})
 			if err != nil {
 				return nil, err
 			}
-			logging.EzPrint(response)
 			tools[variant.ID] = *response
 		}
 	}

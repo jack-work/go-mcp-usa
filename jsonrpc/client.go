@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Client interface {
@@ -26,6 +27,7 @@ type StdioClient struct {
 	conn                  net.Conn
 	notificaticationChans map[string]chan Message[any]
 	responseChans         map[string]chan Message[any]
+	tracerProvider        trace.TracerProvider
 	notLock               *sync.RWMutex
 	resLock               *sync.RWMutex
 }
@@ -35,16 +37,26 @@ type Connection struct {
 	Reader *bufio.Reader
 }
 
-func (client StdioClient) Notify(method string, params any) error {
+func (client StdioClient) Notify(ctx context.Context, method string, params any) error {
+	tracer := client.tracerProvider.Tracer("jsonrpc")
+	ctx, span := tracer.Start(ctx, "notify")
+	defer span.End()
 	return notifyMessage(Message[any]{JSONRPC: "2.0", Method: method, Params: params}, client.conn)
 }
 
 // Action -> func with no params
-func (client StdioClient) SendActionMessage(method string) (*Message[any], error) {
+// TODO: figure out how to unify this. I'm sure there is a way.  WithArgs functional option config?
+func (client StdioClient) SendActionMessage(ctx context.Context, method string) (*Message[any], error) {
+	tracer := client.tracerProvider.Tracer("jsonrpc")
+	ctx, span := tracer.Start(ctx, "SendMessage")
+	defer span.End()
 	return client.sendMessage(Message[any]{JSONRPC: "2.0", Method: method})
 }
 
-func (client StdioClient) SendMessage(method string, params any) (*Message[any], error) {
+func (client StdioClient) SendMessage(ctx context.Context, method string, params any) (*Message[any], error) {
+	tracer := client.tracerProvider.Tracer("jsonrpc")
+	ctx, span := tracer.Start(ctx, "SendMessage")
+	defer span.End()
 	return client.sendMessage(Message[any]{JSONRPC: "2.0", Method: method, Params: params})
 }
 
@@ -85,7 +97,7 @@ func (client *StdioClient) sendMessage(message Message[any]) (*Message[any], err
 	}
 }
 
-func NewStdioClient[TId comparable](ctx context.Context, client *Connection) (*StdioClient, <-chan error, error) {
+func NewStdioClient[TId comparable](ctx context.Context, client *Connection, tp trace.TracerProvider) (*StdioClient, <-chan error, error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	// One go routine to process the output of the conn, which sends a message over a channel to:
 	// A multiplexer below to fan out to at most three listeners
@@ -132,6 +144,7 @@ func NewStdioClient[TId comparable](ctx context.Context, client *Connection) (*S
 		notLock:               &notLock,
 		resLock:               &resLock,
 		responseChans:         responseChans,
+		tracerProvider:        tp,
 	}, doneCh, nil
 }
 
