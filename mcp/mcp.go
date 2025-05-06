@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/mitchellh/mapstructure"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Server interface {
@@ -21,6 +22,7 @@ type Client struct {
 	CancelConnection    context.CancelFunc
 	RpcDone             <-chan error
 	CancelRpc           context.CancelFunc
+	TracerProvider      trace.TracerProvider
 }
 
 // executes mcp handshake and initializes tools
@@ -38,7 +40,7 @@ func (client *Client) Initialize() error {
 		return err
 	}
 
-	logging.PrintTelemetry(res1)
+	logging.EzPrint(res1)
 	err = client.Notify("notifications/initialized", InitializedNotification{})
 	if err != nil {
 		return err

@@ -85,7 +85,7 @@ func (client *StdioClient) sendMessage(message Message[any]) (*Message[any], err
 	}
 }
 
-func NewStdioClient[TId comparable](ctx context.Context, client *Connection) (*StdioClient, error) {
+func NewStdioClient[TId comparable](ctx context.Context, client *Connection) (*StdioClient, <-chan error, error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	// One go routine to process the output of the conn, which sends a message over a channel to:
 	// A multiplexer below to fan out to at most three listeners
@@ -98,41 +98,30 @@ func NewStdioClient[TId comparable](ctx context.Context, client *Connection) (*S
 	main := make(chan Message[any])
 
 	// Parses the json in the reader
-	go processOutput(client.Reader, main, cancel)
+	go processOutput(ctx, client.Reader, main, cancel)
 
 	notLock, resLock := sync.RWMutex{}, sync.RWMutex{}
-
-	telemChan := make(chan Message[any])
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case result := <-telemChan:
-				logging.PrintTelemetry(result)
-			}
-		}
-	}()
 
 	// Pass from the main channel to the response channels
 	// The responseChan can contain type specific wrappers so that we can leverage the mcp in the other folder
 	responseChans := make(map[string]chan Message[any], 0)
-	// multiplexer
+
+	doneCh := make(chan error)
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
+				doneCh <- ctx.Err()
 				return
 			case response, ok := <-main:
 				if !ok {
 					return
 				}
 
-				telemChan <- response
+				logging.EzPrint(response)
 				SendChannel(&notLock, notificationChannels, response.Method, response)
 				SendChannel(&resLock, responseChans, response.ID, response)
 			}
-			// todo: log failure
 		}
 	}()
 
@@ -143,7 +132,7 @@ func NewStdioClient[TId comparable](ctx context.Context, client *Connection) (*S
 		notLock:               &notLock,
 		resLock:               &resLock,
 		responseChans:         responseChans,
-	}, nil
+	}, doneCh, nil
 }
 
 func SendChannel(notLock *sync.RWMutex, chans map[string]chan Message[any], key string, value Message[any]) {
@@ -157,29 +146,35 @@ func SendChannel(notLock *sync.RWMutex, chans map[string]chan Message[any], key 
 	}
 }
 
-// if the reader dies, Scan will return false and this will fail.
-// probably should run the scanner in a for select and handle ctx failure appropriately.
-// this works for now, so TODO:
-// probably can do something with timeout where every successful scan resets the timeout, otherwise
-// cancel is called
-func processOutput(reader io.Reader, responseChan chan Message[any], cancel context.CancelCauseFunc) {
+func processOutput(ctx context.Context, reader io.Reader, responseChan chan Message[any], cancel context.CancelCauseFunc) {
 	// Process stdout for JSON messages
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) == 0 {
-			continue
-		}
-		// Remove any non-printable characters at the beginning
-		clean := getCleanLine(line)
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			line := scanner.Text()
+			if len(line) == 0 {
+				continue
+			}
+			// Remove any non-printable characters at the beginning
+			clean := getCleanLine(line)
 
-		// Try to parse as JSON
-		var response Message[any]
-		if err := json.Unmarshal([]byte(clean), &response); err != nil {
-			fmt.Println(err)
-			cancel(scanner.Err())
-		} else {
-			responseChan <- response
+			// Try to parse as JSON
+			var response Message[any]
+			if err := json.Unmarshal([]byte(clean), &response); err != nil {
+				fmt.Println(err)
+				// Probably shouldn't take the entire server down on one bad json input.
+				// Instead, we should probably log the contents of the pipe someplace for debug to see why the json
+				// could not be unmarshalled.
+				// If we ever want to deploy and productize this, we won't want to log the customer's conversation.
+				// Rather we could store it someplace separately and disable it in production.  We could reenable it
+				// at customer request if we need to debug their use case.
+				cancel(scanner.Err())
+			} else {
+				responseChan <- response
+			}
 		}
 	}
 
@@ -216,7 +211,7 @@ func ReceiveMessages[TId any](responseChan chan Message[any]) {
 	for {
 		select {
 		case response := <-responseChan:
-			logging.PrintTelemetry(response)
+			logging.EzPrint(response)
 		}
 	}
 }

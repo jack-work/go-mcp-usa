@@ -52,7 +52,7 @@ func GetAnthropicClient() (*anthropic.Client, error) {
 
 // newer version that uses built in anthropic types
 func StreamMessage2(input anthropic.MessageNewParams, context context.Context, task func(string) error) (*anthropic.Message, error) {
-	logging.PrintTelemetry(input)
+	logging.EzPrint(input)
 	client, err := GetAnthropicClient()
 	if err != nil {
 		return nil, err

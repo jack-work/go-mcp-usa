@@ -6,7 +6,7 @@ import (
 	"runtime/debug"
 )
 
-func PrintTelemetry[T any](content T) {
+func EzPrint[T any](content T) {
 	telem, err := json.MarshalIndent(content, "", "  ")
 	if err != nil {
 		fmt.Printf("Call stack:\n%s\n", debug.Stack())

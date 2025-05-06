@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"figaro/anthropicbridge"
+	"figaro/dockerbridge"
 	"figaro/jsonrpc"
 	"figaro/logging"
 	"figaro/mcp"
@@ -13,12 +14,71 @@ import (
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"go.opentelemetry.io/otel/trace"
 )
 
+const FigaroChi = "figaro"
+
 type Figaro struct {
-	Clients []mcp.Client
-	// Might get stale when we implement dynamic tool introduction
-	toolsCache []mcp.Tool
+	Clients        []mcp.Client
+	toolsCache     []mcp.Tool // Might get stale when we implement dynamic tool introduction
+	tracerProvider trace.TracerProvider
+}
+
+type ServerRegistry struct {
+	DockerServers []dockerbridge.ContainerDefinition `json:"docker_servers"`
+}
+
+// Initializes an instance of a Figaro application configured with the provided server list, and returns it.
+// Iff error, return val will be nil
+// Otherwise, it will always have a non-nil value, even if empty list.
+// If server does not return any tools by responding with nil tools in result rather than empty list, that's fine,
+// it's interpreted to mean empty list for interest of compatibility.
+func SummonFigaro(ctx context.Context, tp trace.TracerProvider, servers ServerRegistry) (*Figaro, error) {
+	mcpClients := make([]mcp.Client, len(servers.DockerServers))
+	for i, server := range servers.DockerServers {
+		// parent context for each pair
+		serviceContext := context.WithoutCancel(ctx)
+
+		// child context for connection
+		connCtx, cancelConn := context.WithCancel(serviceContext)
+		connection, connectionDone, err := dockerbridge.Setup(connCtx, server, tp)
+		if err != nil {
+			cancelConn()
+			return nil, err
+		}
+
+		// child context for client
+		rpcCtx, cancelRpc := context.WithCancel(serviceContext)
+		client, rpcDone, err := jsonrpc.NewStdioClient[string](rpcCtx, connection)
+		if err != nil {
+			cancelConn()
+			cancelRpc()
+			return nil, err
+		}
+		mcpClient := mcp.Client{
+			TargetServer:     server,
+			StdioClient:      *client,
+			ConnectionDone:   connectionDone,
+			CancelConnection: cancelConn,
+			RpcDone:          rpcDone,
+			CancelRpc:        cancelRpc,
+			TracerProvider:   tp,
+		}
+		err = mcpClient.Initialize()
+		if err != nil {
+			cancelConn()
+			cancelRpc()
+			return nil, err
+		}
+		// add failure logging at this level
+		mcpClients[i] = mcpClient
+	}
+
+	return &Figaro{
+		Clients:        mcpClients,
+		tracerProvider: tp,
+	}, nil
 }
 
 func (figaro *Figaro) GetClientForTool(toolName string) *mcp.Client {
@@ -33,7 +93,6 @@ func (figaro *Figaro) GetClientForTool(toolName string) *mcp.Client {
 }
 
 func (figaro *Figaro) GetAllTools() []mcp.Tool {
-	logging.PrintTelemetry(figaro.Clients[0])
 	if figaro.toolsCache != nil {
 		return figaro.toolsCache
 	}
@@ -55,8 +114,7 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 	tools := figaro.GetAllTools()
 	input := strings.Join(args, " ")
 
-	logging.PrintTelemetry(tools)
-	logging.PrintTelemetry("yup")
+	logging.EzPrint(tools)
 	role := anthropic.MessageParamRole(string(anthropic.MessageParamRoleUser))
 
 	conversation := make([]anthropic.MessageParam, 0, 1)
@@ -116,7 +174,7 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 			})
 
 			writeHostFile(conversation, ".conversation.json")
-			logging.PrintTelemetry(message)
+			logging.EzPrint(message)
 		}
 	}
 
@@ -172,7 +230,7 @@ func callTools(message *anthropic.Message, figaro *Figaro) (map[string]jsonrpc.M
 			if err != nil {
 				return nil, err
 			}
-			logging.PrintTelemetry(response)
+			logging.EzPrint(response)
 			tools[variant.ID] = *response
 		}
 	}
