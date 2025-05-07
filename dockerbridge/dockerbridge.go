@@ -234,10 +234,10 @@ func getContainerFromImage(
 		return nil, name, false, fmt.Errorf("No docker images found")
 	}
 
-	span.AddEvent(fmt.Sprintf("📜 Image %s found locally\n", imageName),
+	span.AddEvent(fmt.Sprintf("Image %s found locally", imageName),
 		trace.WithAttributes(attribute.Int("image_count", len(images))))
 
-	logging.EzPrint(images)
+	span.AddEvent("docker", trace.WithAttributes(attribute.String("images", logging.EzMarshal(images))))
 	if len(images) == 0 {
 		return nil, name, false, fmt.Errorf("No images found with the provided name: %s", imageName)
 	}

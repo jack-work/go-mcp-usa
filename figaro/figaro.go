@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"go.opentelemetry.io/otel/attribute"
@@ -21,9 +22,10 @@ import (
 const FigaroChi = "figaro"
 
 type Figaro struct {
-	Clients        []mcp.Client
-	toolsCache     []mcp.Tool // Might get stale when we implement dynamic tool introduction
-	tracerProvider trace.TracerProvider
+	clients         []mcpClientWrapper
+	toolsCache      []mcp.Tool // Might get stale when we implement dynamic tool introduction
+	tracerProvider  trace.TracerProvider
+	anthropicbridge *anthropicbridge.AnthropicBridge
 }
 
 type ServerRegistry struct {
@@ -35,58 +37,119 @@ type ServerRegistry struct {
 // Otherwise, it will always have a non-nil value, even if empty list.
 // If server does not return any tools by responding with nil tools in result rather than empty list, that's fine,
 // it's interpreted to mean empty list for interest of compatibility.
-func SummonFigaro(ctx context.Context, tp trace.TracerProvider, servers ServerRegistry) (*Figaro, error) {
-	mcpClients := make([]mcp.Client, len(servers.DockerServers))
+func SummonFigaro(ctx context.Context, tp trace.TracerProvider, servers ServerRegistry) (*Figaro, context.CancelCauseFunc, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+
+	tracer := tp.Tracer("figaro")
+	ctx, span := tracer.Start(ctx, "summonfigaro")
+	defer span.End()
+
+	mcpClients := make([]mcpClientWrapper, len(servers.DockerServers))
 	for i, server := range servers.DockerServers {
 		// parent context for each pair
 		serviceContext := context.WithoutCancel(ctx)
 
 		// child context for connection
 		connCtx, cancelConn := context.WithCancel(serviceContext)
+
+		// TODO: Manage lifecycle instead of taking down the whole server
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					cancelConn()
+					break
+				case <-connCtx.Done():
+					cancel(connCtx.Err())
+					break
+				}
+			}
+		}()
+
 		connection, connectionDone, err := dockerbridge.Setup(connCtx, server, tp)
 		if err != nil {
+			cancel(err)
 			cancelConn()
-			return nil, err
+			return nil, nil, err
 		}
 
 		// child context for client
 		rpcCtx, cancelRpc := context.WithCancel(serviceContext)
+
+		// TODO: Manage lifecycle instead of taking down the whole server
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					cancelConn()
+					break
+				case <-rpcCtx.Done():
+					cancel(rpcCtx.Err())
+					break
+				}
+			}
+		}()
+
 		client, rpcDone, err := jsonrpc.NewStdioClient[string](rpcCtx, connection, tp)
 		if err != nil {
 			cancelConn()
 			cancelRpc()
-			return nil, err
+			cancel(err)
+			return nil, nil, err
 		}
-		mcpClient := mcp.Client{
-			TargetServer:     server,
-			StdioClient:      *client,
-			ConnectionDone:   connectionDone,
-			CancelConnection: cancelConn,
-			RpcDone:          rpcDone,
-			CancelRpc:        cancelRpc,
-			TracerProvider:   tp,
-		}
-		err = mcpClient.Initialize(ctx)
+
+		mcpClient, err := mcp.Initialize(ctx, server, client, tp)
 		if err != nil {
 			cancelConn()
 			cancelRpc()
-			return nil, err
+			cancel(err)
+			return nil, nil, err
 		}
+
 		// add failure logging at this level
-		mcpClients[i] = mcpClient
+		mcpClients[i] = mcpClientWrapper{
+			mcpClient: mcpClient,
+			connection: &lifeCycleWrapper{
+				done:   connectionDone,
+				cancel: cancelConn,
+			},
+			rpcClient: &serviceWrapper[jsonrpc.Client]{
+				instance: client,
+				done:     rpcDone,
+				cancel:   cancelRpc,
+			},
+		}
 	}
 
 	return &Figaro{
-		Clients:        mcpClients,
+		clients:        mcpClients,
 		tracerProvider: tp,
-	}, nil
+	}, cancel, nil
+}
+
+type serviceWrapper[T any] struct {
+	instance T
+	done     <-chan error
+	cancel   context.CancelFunc
+}
+
+type lifeCycleWrapper struct {
+	done   <-chan error
+	cancel context.CancelFunc
+}
+
+type mcpClientWrapper struct {
+	mcpClient  *mcp.Client
+	connection *lifeCycleWrapper
+	rpcClient  *serviceWrapper[jsonrpc.Client]
 }
 
 func (figaro *Figaro) GetClientForTool(toolName string) *mcp.Client {
-	for _, client := range figaro.Clients {
+	for _, clientWrapper := range figaro.clients {
+		client := clientWrapper.mcpClient
 		for _, tool := range client.Tools {
 			if tool.Name == toolName {
-				return &client
+				return client
 			}
 		}
 	}
@@ -98,11 +161,13 @@ func (figaro *Figaro) GetAllTools() []mcp.Tool {
 		return figaro.toolsCache
 	}
 	cumToolSize := 0
-	for _, client := range figaro.Clients {
+	for _, clientWrapper := range figaro.clients {
+		client := clientWrapper.mcpClient
 		cumToolSize += len(client.Tools)
 	}
 	result := make([]mcp.Tool, cumToolSize)
-	for i, client := range figaro.Clients {
+	for i, clientWrapper := range figaro.clients {
+		client := clientWrapper.mcpClient
 		for j, tool := range client.Tools {
 			result[i+j] = tool
 		}
@@ -112,8 +177,8 @@ func (figaro *Figaro) GetAllTools() []mcp.Tool {
 }
 
 func (figaro *Figaro) Request(args []string, modePtr *string) error {
-	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(ctx.Err())
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Duration(time.Minute), fmt.Errorf("Operation timed out"))
+	defer cancel()
 
 	tracer := figaro.tracerProvider.Tracer("figaro")
 	ctx, span := tracer.Start(ctx, "request")
@@ -128,6 +193,11 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 	role := anthropic.MessageParamRole(string(anthropic.MessageParamRoleUser))
 
 	conversation := make([]anthropic.MessageParam, 0, 1)
+	anthropicClient, err := anthropicbridge.InitAnthropic(anthropicbridge.WithLogging(figaro.tracerProvider))
+	if err != nil {
+		return fmt.Errorf("failed to initialize Anthropic client: %w", err)
+	}
+
 	for range 1 {
 		conversation = append(conversation, anthropic.MessageParam{
 			Content: []anthropic.ContentBlockParamUnion{{
@@ -136,10 +206,24 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 			Role: role,
 		})
 		messageParams := GetMessageNewParams(conversation, tools)
-		message, err := anthropicbridge.StreamMessage2(*messageParams, context.Background(), func(test string) error {
-			fmt.Print(test)
-			return nil
-		})
+		stream, err := anthropicClient.StreamMessage(context.Background(), *messageParams)
+		if err != nil {
+			return err
+		}
+
+		var message *anthropic.Message
+	progressLoop:
+		for {
+			select {
+			case err := <-stream.Error:
+				cancel()
+				return err
+			case next := <-stream.Progress:
+				fmt.Print(next)
+			case message = <-stream.Result:
+				break progressLoop
+			}
+		}
 
 		modelResponse := make([]anthropic.ContentBlockParamUnion, 0, len(message.Content))
 		for _, message := range message.Content {
@@ -150,9 +234,6 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 			Role:    anthropic.MessageParamRoleAssistant,
 		})
 
-		if err != nil {
-			return err
-		}
 		for message.StopReason == "tool_use" {
 			toolResponses, err := callTools(ctx, message, figaro)
 			if err != nil {
@@ -179,11 +260,28 @@ func (figaro *Figaro) Request(args []string, modePtr *string) error {
 			})
 
 			messageParams = GetMessageNewParams(conversation, tools)
-			message, err = anthropicbridge.StreamMessage2(*messageParams, context.Background(), func(test string) error {
-				// TODO: Formalize the console channel and extent it to add formatting, etc.
-				fmt.Print(test)
-				return nil
-			})
+			stream, err = anthropicClient.StreamMessage(ctx, *messageParams)
+			if err != nil {
+				cancel()
+				return err
+			}
+
+		progressLoop2:
+			for {
+				select {
+				case err := <-stream.Error:
+					cancel()
+					return err
+				case next, ok := <-stream.Progress:
+					if !ok {
+						// Progress channel closed, move on to result
+						break progressLoop2
+					}
+					fmt.Print(next)
+				}
+			}
+
+			message = <-stream.Result
 		}
 
 		writeHostFile(conversation, ".conversation.json")

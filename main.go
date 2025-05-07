@@ -36,12 +36,14 @@ func main() {
 	flag.Parse()
 
 	// init MCP
-	servers, err := GetServers()
+	servers, err := getServers()
 	if err != nil {
 		logging.EzPrint(err)
 	}
 
-	figaro, err := figaro.SummonFigaro(ctx, tp, *servers)
+	figaro, cancel, err := figaro.SummonFigaro(ctx, tp, *servers)
+	defer cancel(ctx.Err())
+
 	if err != nil {
 		return
 	}
@@ -58,7 +60,7 @@ func main() {
 	}
 }
 
-func GetServers() (*figaro.ServerRegistry, error) {
+func getServers() (*figaro.ServerRegistry, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err

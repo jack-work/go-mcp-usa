@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"figaro/dockerbridge"
 	"figaro/jsonrpc"
 	"figaro/logging"
 	"fmt"
@@ -16,19 +17,17 @@ type Server interface {
 }
 
 type Client struct {
-	TargetServer        Server
-	Tools               []Tool
 	jsonrpc.StdioClient `json:"-"`
-	ConnectionDone      <-chan error
-	CancelConnection    context.CancelFunc
-	RpcDone             <-chan error
-	CancelRpc           context.CancelFunc
+	TargetServer        Server
+	Tools               []Tool // TODO: replace with interface method and implement a cache with updates
 	TracerProvider      trace.TracerProvider
 }
 
 // executes mcp handshake and initializes tools
-func (client *Client) Initialize(ctx context.Context) error {
-	tracer := client.TracerProvider.Tracer("mcp.Initialize")
+func Initialize(ctx context.Context, server dockerbridge.ContainerDefinition, rpcClient *jsonrpc.StdioClient, tp trace.TracerProvider) (*Client, error) {
+	client := createMcpClient(server, rpcClient, tp)
+
+	tracer := tp.Tracer("mcp.Initialize")
 	ctx, span := tracer.Start(ctx, "mcp.Initialize")
 	defer span.End()
 
@@ -43,30 +42,37 @@ func (client *Client) Initialize(ctx context.Context) error {
 		})
 	if err != nil {
 		span.AddEvent("Error when calling initialize", trace.WithStackTrace(true))
-		return err
+		return nil, err
 	}
 
-	logging.EzPrint(res1)
 	span.AddEvent("Initialize response", trace.WithAttributes(
 		attribute.String("res1", logging.EzMarshal(res1))))
 
 	err = client.Notify(ctx, "notifications/initialized", InitializedNotification{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// need to impl pagination
 	untypedToolsResponse, err := client.SendActionMessage(ctx, "tools/list")
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var toolsResult ListToolsResult
 	err = mapstructure.Decode(untypedToolsResponse.Result, &toolsResult)
 	if err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	client.Tools = toolsResult.Tools
-	return nil
+	return &client, nil
+}
+
+func createMcpClient(server dockerbridge.ContainerDefinition, client *jsonrpc.StdioClient, tp trace.TracerProvider) Client {
+	return Client{
+		StdioClient:    *client,
+		TargetServer:   server,
+		TracerProvider: tp,
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"figaro/logging"
 	"fmt"
 	"io"
 	"net"
@@ -17,9 +16,9 @@ import (
 )
 
 type Client interface {
-	Notify(method string, params any) error
-	SendActionMessage(method string) (*Message[any], error)
-	SendMesage(method string, params any)
+	Notify(ctx context.Context, method string, params any) error
+	SendActionMessage(ctx context.Context, method string) (*Message[any], error)
+	SendMessage(ctx context.Context, method string, params any) (*Message[any], error)
 }
 
 type StdioClient struct {
@@ -37,7 +36,7 @@ type Connection struct {
 	Reader *bufio.Reader
 }
 
-func (client StdioClient) Notify(ctx context.Context, method string, params any) error {
+func (client *StdioClient) Notify(ctx context.Context, method string, params any) error {
 	tracer := client.tracerProvider.Tracer("jsonrpc")
 	ctx, span := tracer.Start(ctx, "notify")
 	defer span.End()
@@ -46,14 +45,14 @@ func (client StdioClient) Notify(ctx context.Context, method string, params any)
 
 // Action -> func with no params
 // TODO: figure out how to unify this. I'm sure there is a way.  WithArgs functional option config?
-func (client StdioClient) SendActionMessage(ctx context.Context, method string) (*Message[any], error) {
+func (client *StdioClient) SendActionMessage(ctx context.Context, method string) (*Message[any], error) {
 	tracer := client.tracerProvider.Tracer("jsonrpc")
 	ctx, span := tracer.Start(ctx, "SendMessage")
 	defer span.End()
 	return client.sendMessage(Message[any]{JSONRPC: "2.0", Method: method})
 }
 
-func (client StdioClient) SendMessage(ctx context.Context, method string, params any) (*Message[any], error) {
+func (client *StdioClient) SendMessage(ctx context.Context, method string, params any) (*Message[any], error) {
 	tracer := client.tracerProvider.Tracer("jsonrpc")
 	ctx, span := tracer.Start(ctx, "SendMessage")
 	defer span.End()
@@ -88,7 +87,6 @@ func (client *StdioClient) sendMessage(message Message[any]) (*Message[any], err
 
 	select {
 	case resp := <-resCh:
-		fmt.Println("test")
 		return &resp, nil
 	case err := <-errCh:
 		return nil, err
@@ -130,7 +128,6 @@ func NewStdioClient[TId comparable](ctx context.Context, client *Connection, tp 
 					return
 				}
 
-				logging.EzPrint(response)
 				SendChannel(&notLock, notificationChannels, response.Method, response)
 				SendChannel(&resLock, responseChans, response.ID, response)
 			}
@@ -153,7 +150,6 @@ func SendChannel(notLock *sync.RWMutex, chans map[string]chan Message[any], key 
 	respCh, exists := chans[key]
 	notLock.Unlock()
 
-	fmt.Println(len(chans))
 	if exists {
 		respCh <- value
 	}
@@ -218,13 +214,4 @@ func notifyMessage(message Message[any], conn net.Conn) error {
 	}
 
 	return nil
-}
-
-func ReceiveMessages[TId any](responseChan chan Message[any]) {
-	for {
-		select {
-		case response := <-responseChan:
-			logging.EzPrint(response)
-		}
-	}
 }

@@ -3,36 +3,71 @@ package anthropicbridge
 import (
 	"context"
 	"errors"
-	"figaro/logging"
 	"figaro/mcp"
-	"fmt"
+	"figaro/utils"
 	"os"
-	"reflect"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"github.com/anthropics/anthropic-sdk-go/shared/constant"
+	"go.opentelemetry.io/otel/trace"
 )
 
-func GetAnthropicTools(tools []mcp.Tool) []anthropic.ToolUnionParam {
-	anTools := make([]anthropic.ToolUnionParam, len(tools))
-	for idx, val := range tools {
-		anTools[idx] = anthropic.ToolUnionParam{
-			OfTool: &anthropic.ToolParam{
-				Name:        val.Name,
-				InputSchema: GetAnthropicInputSchema(val.InputSchema),
-				Description: param.Opt[string]{
-					Value: *val.Description,
-				},
-			},
-		}
-	}
-
-	return anTools
+type AnthropicBridge struct {
+	tracerProvider trace.TracerProvider
+	client         *anthropic.Client
 }
 
-func GetAnthropicInputSchema(schema mcp.ToolInputSchema) anthropic.ToolInputSchemaParam {
+type Opts struct {
+	tracerProvider trace.TracerProvider
+}
+
+type OptsFunc func(o *Opts)
+
+func WithLogging(tp trace.TracerProvider) OptsFunc {
+	return func(o *Opts) {
+		o.tracerProvider = tp
+	}
+}
+
+func InitAnthropic(opts ...OptsFunc) (AnthropicBridge, error) {
+	o := Opts{
+		tracerProvider: nil,
+	}
+	for _, optFunc := range opts {
+		optFunc(&o)
+	}
+
+	client, err := GetAnthropicClient()
+	if err != nil {
+		return AnthropicBridge{}, err
+	}
+
+	return AnthropicBridge{
+		tracerProvider: o.tracerProvider,
+		client:         client,
+	}, nil
+}
+
+func GetAnthropicTools(tools []mcp.Tool) []anthropic.ToolUnionParam {
+	return utils.Map2(tools, getAnthropicTool)
+}
+
+func getAnthropicTool(val mcp.Tool) anthropic.ToolUnionParam {
+	return anthropic.ToolUnionParam{
+		OfTool: &anthropic.ToolParam{
+			Name:        val.Name,
+			InputSchema: getAnthropicInputSchema(val.InputSchema),
+			Description: param.Opt[string]{
+				Value: *val.Description,
+			},
+		},
+	}
+}
+
+func getAnthropicInputSchema(schema mcp.ToolInputSchema) anthropic.ToolInputSchemaParam {
 	return anthropic.ToolInputSchemaParam{
 		Properties: schema.Properties,
 		Type:       constant.Object(schema.Type),
@@ -50,37 +85,77 @@ func GetAnthropicClient() (*anthropic.Client, error) {
 	return &client, nil
 }
 
-// newer version that uses built in anthropic types
-func StreamMessage2(input anthropic.MessageNewParams, context context.Context, task func(string) error) (*anthropic.Message, error) {
-	logging.EzPrint(input)
-	client, err := GetAnthropicClient()
-	if err != nil {
-		return nil, err
-	}
+type ConsoleStreamable[T any] struct {
+	Progress <-chan string
+	Result   <-chan T
+	Error    <-chan error
+}
 
-	stream := client.Messages.NewStreaming(context, input)
-	if stream.Err() != nil {
-		fmt.Println(stream.Err())
+// newer version that uses built in anthropic types
+func (bridge *AnthropicBridge) StreamMessage(
+	ctx context.Context,
+	input anthropic.MessageNewParams,
+) (
+	*ConsoleStreamable[*anthropic.Message],
+	error,
+) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	tracer := bridge.tracerProvider.Tracer("anthropicbridge")
+	ctx, span := tracer.Start(ctx, "StreamMessage")
+
+	client := bridge.client
+	stream := client.Messages.NewStreaming(ctx, input)
+
+	err := stream.Err()
+	if err != nil {
+		cancel(err)
+		span.End(trace.WithStackTrace(true), trace.WithTimestamp(time.Now()))
 		return nil, stream.Err()
 	}
-	message := anthropic.Message{}
-	for stream.Next() {
-		event := stream.Current()
-		err := message.Accumulate(event)
-		if err != nil {
-			panic(err)
-		}
 
-		switch variant := event.AsAny().(type) {
-		case anthropic.ContentBlockDeltaEvent:
-			switch deltaVariant := variant.Delta.AsAny().(type) {
-			case anthropic.TextDelta:
-				task(deltaVariant.Text)
-			default:
-				task(reflect.TypeOf(deltaVariant).Name() + "\n")
+	errCh := make(chan error)
+	message := anthropic.Message{}
+	progress := make(chan string, 1)
+	result := make(chan *anthropic.Message)
+
+	go func() {
+		defer close(errCh)
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err != nil {
+				errCh <- err
 			}
 		}
-	}
+	}()
 
-	return &message, nil
+	go func() {
+		defer close(progress)
+		defer close(result)
+		defer span.End()
+		defer cancel(nil)
+		for stream.Next() {
+			event := stream.Current()
+			err := message.Accumulate(event)
+			if err != nil {
+				cancel(err)
+			}
+
+			switch variant := event.AsAny().(type) {
+			case anthropic.ContentBlockDeltaEvent:
+				switch deltaVariant := variant.Delta.AsAny().(type) {
+				case anthropic.TextDelta:
+					progress <- deltaVariant.Text
+				default:
+					// progress <- reflect.TypeOf(deltaVariant).Name() + "\n"
+				}
+			}
+		}
+		result <- &message
+	}()
+
+	return &ConsoleStreamable[*anthropic.Message]{
+		Progress: progress,
+		Result:   result,
+	}, nil
 }
